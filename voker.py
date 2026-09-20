@@ -588,8 +588,36 @@ def p_john(target, rc, lines, status):
                   [("По этому словарю совпадений нет. Попробуй другой словарь.", "info")])
 
 
-# ============================ ВИЗАРД NMAP ============================
+def p_smb(target, rc, lines, status):
+    txt = _all(lines)
+    shares = re.findall(r"^\s*([\w$.-]+)\s+(?:READ|WRITE|READ, WRITE|Disk)", txt, re.M | re.I)
+    users = re.findall(r"user:\[([^\]]+)\]", txt, re.I)
+    b = []
+    if shares:
+        b.append((f"Найдено сетевых папок (шар): {len(set(shares))}", "warn"))
+        for s in sorted(set(shares))[:15]:
+            b.append((f"Папка: {s}", "info"))
+    if users:
+        b.append((f"Найдено пользователей: {len(set(users))}", "warn"))
+        for u in sorted(set(users))[:15]:
+            b.append((f"Пользователь: {u}", "info"))
+    if not b:
+        return p_generic(target, rc, lines, status)
+    return Report(f"Перечисление {target}", "warn", b)
 
+
+def p_holehe(target, rc, lines, status):
+    used = re.findall(r"\[\+\]\s*(\S+)", _all(lines))
+    if not used:
+        return Report(f"Почта {target} нигде явно не найдена", "info",
+                      [("Ни один сервис не подтвердил регистрацию.", "info")])
+    b = [(f"Почта зарегистрирована на сайтах: {len(used)}", "warn")]
+    for s in used[:20]:
+        b.append((s, "info"))
+    return Report(f"{target} используется на {len(used)} сервисах", "warn", b)
+
+
+# ============================ ВИЗАРД NMAP ============================
 def ask(prompt):
     return input(col(f"\n  {prompt}: ", C.LILAC)).strip()
 
@@ -605,7 +633,7 @@ class ExecSpec:
 
 
 def wiz_nmap(action):
-    target = ask("Введи IP или домен цели")
+    target = pick_target("Введи IP или домен цели")
     if not target:
         return None
     print(col("\n  Что хочешь узнать про цель?", C.LILAC))
@@ -788,6 +816,12 @@ TOOLKIT = [
                "Введи никнейм", binary="sherlock",
                install={"pipx": "pipx install sherlock-project"}, args_template="{target}",
                parser=p_sherlock, typical="1–3 минуты"),
+        Action("Где засветилась почта (holehe)", "На каких сайтах есть аккаунт.",
+               "По e-mail проверяет, на каких сервисах он зарегистрирован — сильный "
+               "OSINT-приём для профилирования.",
+               "Введи e-mail", binary="holehe",
+               install={"pipx": "pipx install holehe"}, args_template="{target}",
+               parser=p_holehe, timeout=300, typical="30–90 сек"),
     ]),
 
     Category("Сеть", "Проверить хост и сеть", [
@@ -817,6 +851,19 @@ TOOLKIT = [
                args_template="-i {target} -c 200 -w {outfile}",
                parser=p_generic, needs_root=True, outfile_ext="pcap", default="any",
                typical="зависит от трафика"),
+        Action("Общие папки и юзеры Windows (smbmap)", "Что расшарено по SMB.",
+               "Перечисляет сетевые папки Windows/Samba и права на них — этап "
+               "перечисления перед доступом к системе.",
+               "Введи IP цели", binary="smbmap",
+               install={"apt": "sudo apt install smbmap", "pipx": "pipx install smbmap"},
+               args_template="-H {target}", parser=p_smb, requires_auth=True, typical="10–40 сек"),
+        Action("Перечисление Windows-сети (enum4linux-ng)", "Юзеры, группы, шары.",
+               "Собирает максимум о цели по SMB: пользователей, группы, папки. "
+               "Классический этап перечисления Active Directory/Windows.",
+               "Введи IP цели", binary="enum4linux-ng",
+               install={"apt": "sudo apt install enum4linux-ng", "pipx": "pipx install enum4linux-ng"},
+               args_template="-A {target}", parser=p_smb, requires_auth=True, timeout=600,
+               typical="30–120 сек"),
     ]),
 
     Category("Веб", "Изучить сайт", [
@@ -1088,7 +1135,7 @@ def run_action(action):
     else:
         target = ""
         if action.prompt:
-            target = ask(action.prompt)
+            target = pick_target(action.prompt)
             if not target:
                 if action.default:
                     target = action.default
@@ -1130,6 +1177,10 @@ def run_action(action):
         rep.raw_lines = lines
         if status in ("timeout", "interrupted"):
             rep.bullets.insert(0, ("Показан частичный результат — команда не завершилась полностью.", "warn"))
+        if status == "ok":
+            msg = harvest_assets(spec.parser, spec.target, lines)
+            if msg:
+                rep.bullets.append((msg, "good"))
 
     print()
     show_report(rep)
@@ -1205,6 +1256,128 @@ def scope_menu():
             SCOPE.clear()
             save_scope()
             print(col("  Scope очищен.", C.GREY))
+
+
+# ============================ ИНВЕНТАРЬ АКТИВОВ ============================
+# Общее хранилище найденного: команды его наполняют, следующие — берут цель оттуда.
+
+INV_FILE = Path.home() / ".voker" / "inventory.json"
+INVENTORY = {"subdomains": [], "hosts": [], "ips": [], "urls": [], "findings": []}
+
+
+def load_inventory():
+    if INV_FILE.exists():
+        try:
+            data = json.loads(INV_FILE.read_text(encoding="utf-8"))
+            for k in INVENTORY:
+                INVENTORY[k] = list(data.get(k, []))
+        except Exception:
+            pass
+
+
+def save_inventory():
+    INV_FILE.parent.mkdir(parents=True, exist_ok=True)
+    INV_FILE.write_text(json.dumps(INVENTORY, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def inv_add(kind, items):
+    if kind not in INVENTORY:
+        return 0
+    n = 0
+    for it in items:
+        it = (it or "").strip()
+        if it and it not in INVENTORY[kind]:
+            INVENTORY[kind].append(it)
+            n += 1
+    if n:
+        save_inventory()
+    return n
+
+
+def inv_pickable():
+    """Цели, которые можно подставить в следующую команду (свежие сверху)."""
+    seen, out = set(), []
+    for it in reversed(INVENTORY["ips"] + INVENTORY["hosts"] + INVENTORY["subdomains"]):
+        if it not in seen:
+            seen.add(it)
+            out.append(it)
+    return out
+
+
+def harvest_assets(parser, target, lines):
+    """После команды вытаскивает активы в инвентарь. Возвращает сообщение или ''."""
+    txt = "\n".join(lines)
+    added = {}
+    if parser is p_subfinder:
+        added["subdomains"] = inv_add("subdomains", [l.strip() for l in lines if l.strip() and "." in l])
+    elif parser is p_httpx:
+        added["hosts"] = inv_add("hosts", [l.strip() for l in lines if l.strip().startswith("http")])
+    elif parser is p_gau:
+        added["urls"] = inv_add("urls", [l.strip() for l in lines if l.strip().startswith("http")])
+    elif parser is p_nmap_ports:
+        ips = re.findall(r"Nmap scan report for \S+ \(([\d.]+)\)", txt) or \
+              re.findall(r"Nmap scan report for ([\d.]+)", txt)
+        added["ips"] = inv_add("ips", ips or ([target] if target else []))
+    elif parser is p_nmap_hosts:
+        found = re.findall(r"Nmap scan report for (\S+)", txt)
+        added["ips"] = inv_add("ips", [f for f in found if re.match(r"[\d.]+$", f)])
+        added["hosts"] = inv_add("hosts", [f for f in found if not re.match(r"[\d.]+$", f)])
+    elif parser is p_dig:
+        added["ips"] = inv_add("ips", re.findall(r"\bIN\s+A\s+([\d.]+)", txt))
+    elif parser is p_nuclei:
+        added["findings"] = inv_add("findings",
+            [l.strip() for l in lines if re.search(r"\[(critical|high|medium|low|info)\]", l, re.I)])
+    total = sum(v for v in added.values() if v)
+    if total:
+        parts = [f"{v} {k}" for k, v in added.items() if v]
+        return f"➕ В инвентарь добавлено: {', '.join(parts)}"
+    return ""
+
+
+def pick_target(prompt):
+    """Спрашивает цель, но сперва предлагает выбрать из инвентаря."""
+    picks = inv_pickable()
+    if not picks:
+        return ask(prompt)
+    print(col(f"\n  {prompt}", C.LILAC))
+    print(col("  или выбери из найденного ранее:", C.GREY))
+    for i, a in enumerate(picks[:10], 1):
+        print(col(f"   [{i}] ", C.PURPLE_BRIGHT) + col(a, C.LILAC))
+    raw = input(col("  Номер из списка или впиши цель: ", C.YELLOW)).strip()
+    if raw.isdigit() and 1 <= int(raw) <= len(picks[:10]):
+        return picks[int(raw) - 1]
+    return raw
+
+
+def inventory_menu():
+    while True:
+        print()
+        panel_open("Инвентарь активов")
+        empty = True
+        labels = {"subdomains": "Поддомены", "hosts": "Живые хосты",
+                  "ips": "IP-адреса", "urls": "Архивные URL", "findings": "Находки"}
+        for k, label in labels.items():
+            items = INVENTORY[k]
+            if items:
+                empty = False
+                print(col(f"\n  {label} ({len(items)}):", C.PURPLE_BRIGHT))
+                for it in items[:15]:
+                    print(col("   • ", C.PURPLE_DEEP) + col(it, C.LILAC))
+                if len(items) > 15:
+                    print(col(f"   … ещё {len(items) - 15}", C.GREY))
+        if empty:
+            print(col("\n  Пусто. Запусти разведку — найденное будет копиться здесь", C.YELLOW))
+            print(col("  и предлагаться как цель в следующих командах.", C.YELLOW))
+        print(col("\n  [1] Очистить инвентарь", C.GREY))
+        print(col("  [0] Назад", C.GREY))
+        ch = input(col("\n  Выбор: ", C.YELLOW)).strip()
+        if ch == "0":
+            return
+        if ch == "1":
+            for k in INVENTORY:
+                INVENTORY[k] = []
+            save_inventory()
+            print(col("  Инвентарь очищен.", C.GREY))
 
 
 # ============================ ПАРСЕРЫ BUG BOUNTY ============================
@@ -1318,12 +1491,154 @@ BB_TOOLS = [
 ]
 
 
-# ============================ ПАЙПЛАЙН РАЗВЕДКИ ============================
+# ============================ СЦЕНАРИИ (МЕТОДОЛОГИЯ) ============================
 
 def _step(n, total, title):
     print()
     panel_card(f"Шаг {n}/{total} · {title}", C.PURPLE_BRIGHT + C.BOLD)
 
+
+def _scenario_step(n, total, stitle, parts, parser, target, typ, raw, bullets, timeout=600):
+    """Один шаг сценария: запуск + отчёт + сбор в инвентарь."""
+    _step(n, total, stitle)
+    if not shutil.which(parts[0]):
+        print(col(f"  ⚠ {parts[0]} не установлен — шаг пропущен.", C.YELLOW))
+        bullets.append((f"— {stitle}: инструмент не установлен —", "warn"))
+        return
+    rc, lines, st = run_with_ui(parts, timeout=timeout, typical=typ)
+    r = parser(target, rc, lines, st)
+    msg = harvest_assets(parser, target, lines)
+    if msg:
+        print(col("  " + msg, C.GREEN))
+    raw.append("")
+    raw.append(f"# {stitle}")
+    raw.extend([l for l in lines if l.strip()])
+    bullets.append((f"— {stitle} —", "info"))
+    bullets.extend(r.bullets[:5])
+
+
+def _finish_scenario(title, target, level, bullets, raw):
+    rep = Report(title, level, bullets)
+    rep.raw_lines = raw
+    print()
+    show_report(rep)
+    fake = Action(title, "", "", binary="")
+    spec = ExecSpec(parts=["scenario", target], target=target, parser=p_generic, title=title)
+    _, htmlf = save_result(fake, spec, 0, "ok", rep)
+    print(col(f"\n  📄 Отчёт сценария: {htmlf}", C.GREEN))
+    print(col(f"     Открыть: xdg-open \"{htmlf}\"", C.GREY))
+    print()
+    show_session_table()
+
+
+def scenario_network():
+    print(col("\n  Разведка сети: живые хосты → порты и сервисы.", C.GREY))
+    subnet = pick_target("Подсеть или IP (192.168.1.0/24)")
+    if not subnet:
+        return
+    if not in_scope(subnet):
+        print(col("\n  ⛔ Цель вне scope.", C.RED + C.BOLD))
+        return
+    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    stamp = time.strftime("%Y%m%d_%H%M%S")
+    hosts_file = RESULTS_DIR / f"{stamp}_hosts.txt"
+    raw, bullets = [], []
+
+    _step(1, 2, "ищу живые устройства (nmap -sn)")
+    rc, lines, st = run_with_ui(["nmap", "-sn", subnet], timeout=300, typical="10–40 сек")
+    ips = re.findall(r"Nmap scan report for (?:\S+ \()?([\d.]+)\)?", "\n".join(lines))
+    ips = sorted(set(ips))
+    harvest_assets(p_nmap_hosts, subnet, lines)
+    hosts_file.write_text("\n".join(ips) + "\n", encoding="utf-8")
+    raw += ["# живые хосты"] + ips
+    bullets.append((f"Живых устройств: {len(ips)}", "info"))
+    print(col(f"  → живых хостов: {len(ips)}", C.LILAC))
+    if not ips:
+        _finish_scenario(f"Разведка сети {subnet}", subnet, "info", bullets, raw)
+        return
+
+    _step(2, 2, "сканирую порты и сервисы (nmap -sV)")
+    rc, lines, st = run_with_ui(["nmap", "-sV", "--top-ports", "50", "-iL", str(hosts_file),
+                                 "--stats-every", "3s"], timeout=1800, typical="1–10 минут")
+    harvest_assets(p_nmap_ports, subnet, lines)
+    r = p_nmap_ports(subnet, rc, lines, st)
+    raw += ["", "# порты/сервисы"] + [l for l in lines if l.strip()]
+    bullets.extend(r.bullets[:15])
+    _finish_scenario(f"Разведка сети {subnet}", subnet, "info", bullets, raw)
+
+
+def scenario_website():
+    print(col("\n  Разведка сайта: инфо о домене → технологии → скрытые страницы.", C.GREY))
+    target = pick_target("Домен или URL сайта (in-scope)")
+    if not target:
+        return
+    if not in_scope(target):
+        print(col("\n  ⛔ Цель вне scope.", C.RED + C.BOLD))
+        return
+    dom = host_of(target)
+    url = target if target.startswith("http") else "https://" + dom
+    raw, bullets = [], []
+    _scenario_step(1, 4, "кому принадлежит (whois)", ["whois", dom], p_whois, dom,
+                   "5–15 сек", raw, bullets, timeout=60)
+    _scenario_step(2, 4, "DNS-записи (dig)", ["dig", dom, "ANY"], p_dig, dom,
+                   "5–10 сек", raw, bullets, timeout=60)
+    _scenario_step(3, 4, "технологии сайта (whatweb)", ["whatweb", url], p_whatweb, url,
+                   "10–30 сек", raw, bullets, timeout=120)
+    _scenario_step(4, 4, "скрытые страницы (gobuster)",
+                   ["gobuster", "dir", "-u", url, "-w",
+                    "/usr/share/wordlists/dirb/common.txt", "-q"],
+                   p_gobuster, url, "1–10 минут", raw, bullets, timeout=900)
+    _finish_scenario(f"Разведка сайта {dom}", dom, "info", bullets, raw)
+
+
+def scenario_osint():
+    print(col("\n  OSINT по домену: владелец → адреса → поддомены → контакты.", C.GREY))
+    dom = pick_target("Домен для OSINT")
+    if not dom:
+        return
+    dom = host_of(dom)
+    raw, bullets = [], []
+    _scenario_step(1, 4, "владелец домена (whois)", ["whois", dom], p_whois, dom,
+                   "5–15 сек", raw, bullets, timeout=60)
+    _scenario_step(2, 4, "адреса и почта (dig)", ["dig", dom, "ANY"], p_dig, dom,
+                   "5–10 сек", raw, bullets, timeout=60)
+    _scenario_step(3, 4, "поддомены (subfinder)", ["subfinder", "-d", dom, "-silent"],
+                   p_subfinder, dom, "20–90 сек", raw, bullets, timeout=300)
+    _scenario_step(4, 4, "почты и контакты (theHarvester)",
+                   ["theHarvester", "-d", dom, "-b", "duckduckgo,bing,crtsh"],
+                   p_theharvester, dom, "20–90 сек", raw, bullets, timeout=300)
+    _finish_scenario(f"OSINT по {dom}", dom, "info", bullets, raw)
+
+
+SCENARIOS = [
+    ("Разведка сети", "живые хосты → порты и сервисы", scenario_network),
+    ("Разведка сайта", "домен → технологии → скрытые страницы", scenario_website),
+    ("OSINT по домену", "владелец → адреса → поддомены → контакты", scenario_osint),
+]
+
+
+def scenarios_menu():
+    while True:
+        print()
+        panel_open("Сценарии · пошаговая методология")
+        print(col("  Готовые конвейеры: инструменты идут по порядку, данные —", C.GREY))
+        print(col("  в общий инвентарь, результат — единый отчёт.\n", C.GREY))
+        for i, (name, desc, _) in enumerate(SCENARIOS, 1):
+            print(col(f"  [{i}] ", C.PURPLE_BRIGHT) + col(name, C.LILAC)
+                  + col("  ⚠", C.RED + C.BOLD))
+            print(col(f"       {desc}", C.GREY))
+        print(col("\n  [0] Назад", C.GREY))
+        ch = input(col("\n  Выбор: ", C.YELLOW)).strip()
+        if ch == "0":
+            return
+        if ch.isdigit() and 1 <= int(ch) <= len(SCENARIOS):
+            SCENARIOS[int(ch) - 1][2]()
+            input(col("\n  Нажми Enter, чтобы продолжить...", C.GREY))
+        else:
+            print(col("  Нет такого пункта.", C.RED))
+
+
+# ============================ ПАЙПЛАЙН РАЗВЕДКИ (BUG BOUNTY) ============================
 
 def run_pipeline():
     print(col("\n  Полная разведка: поддомены → живые хосты → уязвимости.", C.GREY))
@@ -1403,7 +1718,8 @@ def bugbounty_menu():
         print()
         panel_open("Bug Bounty · пошаговый режим")
         print(col("  Порядок работы: задай scope → разведка → поиск уязвимостей.", C.GREY))
-        print(col("  Баг-баунти — авторизованное тестирование, но строго в рамках scope!\n", C.GREY))
+        print(col("  Баг-баунти — авторизованное тестирование, но строго в рамках scope!", C.GREY))
+        print(col("  📄 Полный алгоритм со всеми шагами — в файле METHODOLOGY_BUGBOUNTY.txt\n", C.GREY))
         print(col("  [s] ", C.PURPLE_BRIGHT) + col("Задать scope (разрешённые домены)", C.LILAC)
               + col("  ← начни отсюда", C.YELLOW))
         print(col(f"       сейчас в scope: {', '.join(sorted(SCOPE)) or '(пусто)'}", C.GREY))
@@ -1477,23 +1793,33 @@ def main_menu():
     total = sum(len(c.actions) for c in TOOLKIT)
     while True:
         print()
-        panel_open(f"Главное меню  ·  {total} инструментов")
-        for i, cat in enumerate(TOOLKIT, 1):
-            tag = col("  ⚠ активное", C.RED + C.BOLD) if cat.gated else ""
-            print(col(f"  [{i}] ", C.PURPLE_BRIGHT) + col(cat.name, C.LILAC)
-                  + col(f"  ({len(cat.actions)})", C.GREY) + tag)
-            print(col(f"       {cat.desc}", C.GREY))
-        print(col("\n  [b] ", C.PURPLE_BRIGHT) + col("🎯 Bug Bounty — пошаговый режим", C.LILAC))
+        panel_open("Voker · главное меню")
+        print(col("  Методика: разведка → перечисление → уязвимости → доступ → отчёт", C.GREY))
+        print(col("  🧭 Сценарии ведут по этому пути; отдельные инструменты — ниже.\n", C.GREY))
+        print(col("  [c] ", C.PURPLE_BRIGHT) + col("🧭 Сценарии (пошаговая методология)", C.LILAC))
+        print(col("  [b] ", C.PURPLE_BRIGHT) + col("🎯 Bug Bounty — режим веб-охоты", C.LILAC))
+        print(col("  [a] ", C.PURPLE_BRIGHT) + col("📦 Инвентарь активов", C.LILAC)
+              + col(f"   (найдено целей: {len(inv_pickable())})", C.GREY))
         print(col("  [s] ", C.PURPLE_BRIGHT) + col("Scope — разрешённые домены", C.LILAC)
               + col(f"   ({len(SCOPE)} в списке)", C.GREY))
-        print(col("  [o] Собрать общий отчёт сессии (HTML)", C.GREY))
-        print(col("  [q] Выход", C.GREY))
+        print(col(f"\n  Отдельные инструменты ({total}):", C.GREY))
+        for i, cat in enumerate(TOOLKIT, 1):
+            tag = col("  ⚠", C.RED + C.BOLD) if cat.gated else ""
+            print(col(f"  [{i}] ", C.PURPLE_BRIGHT) + col(cat.name, C.LILAC)
+                  + col(f"  ({len(cat.actions)})", C.GREY) + tag)
+        print(col("\n  [o] Общий отчёт сессии (HTML)   ·   [q] Выход", C.GREY))
         choice = input(col("\n  Выбор: ", C.YELLOW)).strip().lower()
         if choice in ("q", "quit", "exit"):
             print(col("\n  До встречи. Учись легально. 💜\n", C.PURPLE_BRIGHT))
             return
+        if choice == "c":
+            scenarios_menu()
+            continue
         if choice == "b":
             bugbounty_menu()
+            continue
+        if choice == "a":
+            inventory_menu()
             continue
         if choice == "s":
             scope_menu()
@@ -1572,6 +1898,7 @@ def main():
         print_banner()
         ensure_disclaimer()
         load_scope()
+        load_inventory()
         main_menu()
     except (KeyboardInterrupt, EOFError):
         print(col("\n\n  Выход.\n", C.GREY))
