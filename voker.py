@@ -1,14 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Voker — тулкит-проводник для начинающих в кибербезопасности.
+Voker 1.0 — понятный проводник по кибербезопасности для начинающих.
 
-Voker НЕ содержит инструменты внутри себя. Он "оркестратор": проверяет,
-установлен ли инструмент, помогает его поставить и запускает. Часть пунктов —
-встроенные функции на чистом Python (работают без установки).
-
-Результаты каждой команды сохраняются в ~/.voker/results/ (txt + json,
-а у перехвата трафика — .pcap для Wireshark) и показываются сводной табличкой.
+Voker не содержит инструменты внутри себя. Он проверяет, установлен ли нужный
+инструмент, помогает поставить, запускает его — а вместо непонятной простыни
+вывода показывает человеческий отчёт («открыт порт 80 — это веб-сайт») и
+сохраняет красивый HTML-отчёт, который открывается в браузере.
 
 Запуск:  python3 voker.py
 Список:  python3 voker.py --list
@@ -19,10 +17,9 @@ import re
 import sys
 import json
 import time
+import html
 import shlex
 import shutil
-import base64
-import hashlib
 import textwrap
 import threading
 import subprocess
@@ -30,30 +27,25 @@ from pathlib import Path
 from typing import Optional, Callable
 from dataclasses import dataclass, field
 
-# ============================ ЦВЕТА (ANSI) ============================
+# ============================ ЦВЕТА ============================
 
 class C:
-    RESET = "\033[0m"
-    BOLD = "\033[1m"
-    DIM = "\033[2m"
-    PURPLE = "\033[38;5;135m"
-    PURPLE_BRIGHT = "\033[38;5;177m"
-    PURPLE_DEEP = "\033[38;5;99m"
-    LILAC = "\033[38;5;183m"
-    GREY = "\033[38;5;245m"
-    GREEN = "\033[38;5;114m"
-    RED = "\033[38;5;203m"
-    YELLOW = "\033[38;5;221m"
+    RESET = "\033[0m"; BOLD = "\033[1m"; DIM = "\033[2m"
+    PURPLE = "\033[38;5;135m"; PURPLE_BRIGHT = "\033[38;5;177m"
+    PURPLE_DEEP = "\033[38;5;99m"; LILAC = "\033[38;5;183m"
+    GREY = "\033[38;5;245m"; GREEN = "\033[38;5;114m"
+    RED = "\033[38;5;203m"; YELLOW = "\033[38;5;221m"
 
 
-def _supports_color() -> bool:
+def _supports_color():
     return not os.environ.get("NO_COLOR") and sys.stdout.isatty()
 
 
 USE_COLOR = _supports_color()
+IS_TTY = sys.stdout.isatty()
 
 
-def col(text: str, color: str) -> str:
+def col(text, color):
     return f"{color}{text}{C.RESET}" if USE_COLOR else text
 
 
@@ -71,56 +63,34 @@ BANNER = r"""
 def print_banner():
     for line in BANNER.strip("\n").splitlines():
         print(col(line, C.PURPLE_BRIGHT + C.BOLD))
-    print(col("  тулкит-проводник для начинающих  ·  v0.4", C.LILAC))
-    print(col("  Voker вызывает инструменты, а не заменяет их знание", C.GREY))
+    print(col("  понятный проводник по кибербезопасности  ·  v1.0", C.LILAC))
     print()
 
 
 # ============================ ПАНЕЛИ ============================
 
-def term_width() -> int:
+def term_width():
     try:
-        w = shutil.get_terminal_size().columns
+        return max(48, min(shutil.get_terminal_size().columns, 100))
     except Exception:
-        w = 80
-    return max(48, min(w, 100))
+        return 80
 
 
-def _pad(s: str, width: int) -> str:
+def _pad(s, width):
     if len(s) > width:
         s = s[: width - 1] + "…"
     return s + " " * (width - len(s))
 
 
-def panel_card(text: str, color: str):
-    w = term_width()
-    inner = w - 4
+def panel_card(text, color):
+    w = term_width(); inner = w - 4
     print(col("╭" + "─" * (w - 2) + "╮", C.PURPLE_DEEP))
     print(col("│ ", C.PURPLE_DEEP) + col(_pad(text, inner), color) + col(" │", C.PURPLE_DEEP))
     print(col("╰" + "─" * (w - 2) + "╯", C.PURPLE_DEEP))
 
 
-def panel_open(title: str):
+def panel_open(title):
     panel_card("▸ " + title, C.PURPLE_BRIGHT + C.BOLD)
-
-
-def panel_close(ok: bool, elapsed: float):
-    status = ("✓ готово" if ok else "✗ завершилось с ошибкой") + f"   ·   {elapsed:.1f}s"
-    panel_card(status, C.GREEN if ok else C.RED)
-
-
-def rail_line(s: str):
-    print(col("│ ", C.PURPLE_DEEP) + col(s, C.LILAC))
-
-
-def rail(lines):
-    w = term_width()
-    inner = w - 2
-    if isinstance(lines, str):
-        lines = lines.splitlines() or [""]
-    for ln in lines:
-        for wl in (textwrap.wrap(ln, inner) or [""]):
-            rail_line(wl)
 
 
 # ============================ ТАБЛИЦА ============================
@@ -138,19 +108,611 @@ def print_table(headers, rows, caps):
             mx = max(mx, len(_fit(r[i], caps[i])))
         widths.append(min(mx, caps[i]))
 
-    def border(l, m, r):
+    def bd(l, m, r):
         return l + m.join("─" * (w + 2) for w in widths) + r
 
-    def row_str(cells):
+    def rw(cells):
         return "│" + "│".join(" " + _fit(c, caps[i]).ljust(widths[i]) + " "
                               for i, c in enumerate(cells)) + "│"
 
-    print(col(border("╭", "┬", "╮"), C.PURPLE_DEEP))
-    print(col(row_str(headers), C.PURPLE_BRIGHT + C.BOLD))
-    print(col(border("├", "┼", "┤"), C.PURPLE_DEEP))
+    print(col(bd("╭", "┬", "╮"), C.PURPLE_DEEP))
+    print(col(rw(headers), C.PURPLE_BRIGHT + C.BOLD))
+    print(col(bd("├", "┼", "┤"), C.PURPLE_DEEP))
     for r in rows:
-        print(col(row_str(r), C.LILAC))
-    print(col(border("╰", "┴", "╯"), C.PURPLE_DEEP))
+        print(col(rw(r), C.LILAC))
+    print(col(bd("╰", "┴", "╯"), C.PURPLE_DEEP))
+
+
+# ============================ ОТЧЁТ (структура) ============================
+
+@dataclass
+class Report:
+    headline: str
+    level: str = "info"          # good | info | warn | bad
+    bullets: list = field(default_factory=list)   # [(текст, уровень)]
+    raw_lines: list = field(default_factory=list)
+
+
+LEVEL_EMOJI = {"good": "✅", "info": "•", "warn": "⚠️", "bad": "❌"}
+LEVEL_COLOR = {"good": C.GREEN, "info": C.LILAC, "warn": C.YELLOW, "bad": C.RED}
+
+
+def show_report(rep):
+    panel_card(rep.headline, LEVEL_COLOR.get(rep.level, C.LILAC) + C.BOLD)
+    for text, lvl in rep.bullets:
+        e = LEVEL_EMOJI.get(lvl, "•")
+        print(col(f"   {e} ", LEVEL_COLOR.get(lvl, C.LILAC)) + col(text, C.LILAC))
+
+
+# ============================ АНИМАЦИЯ ПРОГРЕССА ============================
+
+SPIN = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+_PCT = re.compile(r"([\d]+(?:\.\d+)?)\s*%\s*done", re.I)
+_FRAC = re.compile(r"(?:progress:?\s*\[?)\s*(\d+)\s*/\s*(\d+)", re.I)
+
+
+def extract_percent(line):
+    m = _PCT.search(line)
+    if m:
+        try:
+            return max(0.0, min(100.0, float(m.group(1))))
+        except ValueError:
+            return None
+    m = _FRAC.search(line)
+    if m:
+        a, b = int(m.group(1)), int(m.group(2))
+        if b > 0:
+            return max(0.0, min(100.0, a * 100.0 / b))
+    return None
+
+
+def _render_progress(pct, elapsed, i, typical):
+    frame = SPIN[i % len(SPIN)]
+    t = f"{elapsed:4.0f}s"
+    if pct is not None:
+        filled = int(pct / 5)
+        bar = "█" * filled + "░" * (20 - filled)
+        line = f"  {frame} [{bar}] {pct:5.1f}%   ·   {t}"
+    else:
+        hint = f"   ·   {typical}" if typical else ""
+        line = f"  {frame} работаю, собираю данные...   ·   {t}{hint}"
+    sys.stdout.write("\r" + col(line, C.PURPLE_BRIGHT) + "     ")
+    sys.stdout.flush()
+
+
+def _clear_line():
+    sys.stdout.write("\r" + " " * (term_width()) + "\r")
+    sys.stdout.flush()
+
+
+def _kill(proc):
+    proc.terminate()
+    try:
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+
+
+def run_with_ui(parts, timeout=0, typical=""):
+    """Запускает процесс, прячет сырой вывод за анимацию, собирает его.
+    Возвращает (код, строки, статус: ok|timeout|interrupted|error)."""
+    shared = {"lines": [], "pct": None}
+    try:
+        proc = subprocess.Popen(parts, stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT, text=True, bufsize=1)
+    except FileNotFoundError:
+        return 1, ["<не удалось запустить>"], "error"
+
+    def reader():
+        try:
+            for line in proc.stdout:
+                line = line.rstrip("\n")
+                shared["lines"].append(line)
+                p = extract_percent(line)
+                if p is not None:
+                    shared["pct"] = p
+        except Exception:
+            pass
+
+    th = threading.Thread(target=reader, daemon=True)
+    th.start()
+
+    status = "ok"
+    start = time.time()
+    i = 0
+    if not IS_TTY:
+        print(col("  работаю...", C.PURPLE_BRIGHT))
+    try:
+        while proc.poll() is None:
+            el = time.time() - start
+            if timeout and el > timeout:
+                _kill(proc)
+                status = "timeout"
+                break
+            if IS_TTY:
+                _render_progress(shared["pct"], el, i, typical)
+                i += 1
+            time.sleep(0.1)
+    except KeyboardInterrupt:
+        _kill(proc)
+        status = "interrupted"
+
+    th.join(timeout=2)
+    if IS_TTY:
+        _clear_line()
+    rc = proc.returncode if proc.returncode is not None else -1
+    return rc, shared["lines"], status
+
+
+def run_interactive(parts):
+    try:
+        r = subprocess.run(parts)
+        return r.returncode, ("ok" if r.returncode == 0 else "error")
+    except KeyboardInterrupt:
+        return 130, "interrupted"
+
+
+# ============================ ПАРСЕРЫ ОТЧЁТОВ ============================
+
+PORTS = {
+    21: "FTP (передача файлов)", 22: "SSH (удалённый доступ)",
+    23: "Telnet (устаревший доступ)", 25: "SMTP (почта)", 53: "DNS",
+    80: "веб-сайт (HTTP)", 110: "POP3 (почта)", 139: "SMB (сеть Windows)",
+    143: "IMAP (почта)", 443: "веб-сайт (HTTPS)", 445: "SMB (файлы Windows)",
+    3306: "MySQL (база данных)", 3389: "RDP (рабочий стол Windows)",
+    5432: "PostgreSQL (база данных)", 8080: "веб-сервер (доп. порт)",
+    8443: "веб-сайт HTTPS (доп. порт)",
+}
+
+
+def _all(lines):
+    return "\n".join(lines)
+
+
+def p_generic(target, rc, lines, status):
+    if status == "timeout":
+        return Report("Не успело завершиться за отведённое время", "warn",
+                      [("Показан частичный результат — полный текст в отчёте.", "warn")])
+    if status == "interrupted":
+        return Report("Прервано вручную", "warn",
+                      [("Сохранено то, что успело прийти.", "warn")])
+    if rc != 0 and not lines:
+        return Report("Команда завершилась с ошибкой", "bad",
+                      [("Подробности в техническом выводе отчёта.", "bad")])
+    n = len([l for l in lines if l.strip()])
+    return Report("Готово", "good", [(f"Получено {n} строк вывода — детали в отчёте.", "info")])
+
+
+def p_ping(target, rc, lines, status):
+    txt = _all(lines)
+    loss = re.search(r"(\d+(?:\.\d+)?)%\s*packet loss", txt)
+    avg = re.search(r"=\s*[\d.]+/([\d.]+)/", txt)
+    if loss and float(loss.group(1)) >= 100:
+        return Report(f"{target} не отвечает на ping", "warn", [
+            ("Хост не ответил. Это не всегда значит, что он выключен —", "info"),
+            ("многие серверы специально игнорируют ping.", "info")])
+    if loss and float(loss.group(1)) < 100:
+        b = [(f"{target} на связи и отвечает.", "good")]
+        if avg:
+            b.append((f"Среднее время ответа: {float(avg.group(1)):.0f} мс.", "info"))
+        if float(loss.group(1)) > 0:
+            b.append((f"Часть пакетов потеряна ({loss.group(1)}%) — связь нестабильна.", "warn"))
+        return Report(f"{target} доступен", "good", b)
+    return p_generic(target, rc, lines, status)
+
+
+def _parse_nmap_ports(lines):
+    open_ports = []
+    for l in lines:
+        m = re.match(r"\s*(\d+)/tcp\s+open\s+(\S+)(.*)", l)
+        if m:
+            port = int(m.group(1))
+            svc = m.group(2)
+            ver = m.group(3).strip()
+            open_ports.append((port, svc, ver))
+    return open_ports
+
+
+def _nmap_down(lines):
+    t = _all(lines).lower()
+    return ("host seems down" in t) or ("0 hosts up" in t) or ("note: host" in t)
+
+
+def p_nmap_ports(target, rc, lines, status):
+    if _nmap_down(lines):
+        return Report(f"{target} недоступен или блокирует скан", "warn", [
+            ("Хост не отвечает на сканирование. Возможно, он offline", "info"),
+            ("или закрыт файрволом.", "info")])
+    ports = _parse_nmap_ports(lines)
+    if not ports:
+        return Report("Открытых портов не найдено", "good", [
+            ("Все просканированные порты закрыты — снаружи зацепиться не за что.", "good")])
+    lvl = "warn" if len(ports) > 3 else "info"
+    b = [(f"Найдено открытых портов: {len(ports)}", lvl)]
+    for port, svc, ver in ports:
+        human = PORTS.get(port, svc)
+        line = f"Порт {port} открыт — {human}"
+        if ver:
+            line += f"  [{ver}]"
+        b.append((line, "info"))
+    return Report(f"У {target} есть открытые порты", lvl, b)
+
+
+def p_nmap_os(target, rc, lines, status):
+    txt = _all(lines)
+    m = re.search(r"OS details:\s*(.+)", txt) or re.search(r"Running:\s*(.+)", txt)
+    if m:
+        return Report(f"Похоже на: {m.group(1).strip()}", "info",
+                      [("Это предположение nmap по сетевым отпечаткам, не 100%.", "info")])
+    if _nmap_down(lines):
+        return Report(f"{target} недоступен", "warn", [("Хост не отвечает.", "info")])
+    return Report("Не удалось определить ОС", "info",
+                  [("nmap не смог уверенно распознать систему.", "info")])
+
+
+def p_nmap_vuln(target, rc, lines, status):
+    n = _all(lines).count("VULNERABLE")
+    if n > 0:
+        return Report(f"Найдено потенциальных уязвимостей: {n}", "bad", [
+            (f"nmap отметил {n} возможных проблем — смотри детали в отчёте.", "bad"),
+            ("«Потенциальных» — проверяй вручную, бывают ложные срабатывания.", "warn")])
+    if _nmap_down(lines):
+        return Report(f"{target} недоступен", "warn", [("Хост не отвечает.", "info")])
+    return Report("Явных уязвимостей не найдено", "good",
+                  [("Скрипты nmap ничего очевидного не нашли.", "good")])
+
+
+def p_nmap_hosts(target, rc, lines, status):
+    hosts = re.findall(r"Nmap scan report for\s+(\S+)", _all(lines))
+    if not hosts:
+        return Report("Живых устройств не найдено", "info",
+                      [("В указанной сети никто не ответил.", "info")])
+    b = [(f"Найдено устройств: {len(hosts)}", "info")]
+    for h in hosts[:30]:
+        b.append((h, "info"))
+    return Report(f"В сети активно {len(hosts)} устройств", "info", b)
+
+
+def p_whois(target, rc, lines, status):
+    txt = _all(lines)
+    def find(*keys):
+        for k in keys:
+            m = re.search(rf"{k}:\s*(.+)", txt, re.I)
+            if m and m.group(1).strip():
+                return m.group(1).strip()
+        return None
+    reg = find("Registrar")
+    created = find("Creation Date", "created")
+    org = find("Registrant Organization", "OrgName", "org")
+    country = find("Registrant Country", "Country")
+    b = []
+    if org: b.append((f"Владелец: {org}", "info"))
+    if reg: b.append((f"Регистратор: {reg}", "info"))
+    if created: b.append((f"Домен создан: {created}", "info"))
+    if country: b.append((f"Страна: {country}", "info"))
+    if not b:
+        return p_generic(target, rc, lines, status)
+    return Report(f"Данные по {target}", "info", b)
+
+
+def p_dig(target, rc, lines, status):
+    ips = re.findall(r"\bIN\s+A\s+([\d.]+)", _all(lines))
+    mx = re.findall(r"\bIN\s+MX\s+\d+\s+(\S+)", _all(lines))
+    b = []
+    if ips:
+        b.append((f"IP-адрес(а): {', '.join(sorted(set(ips)))}", "info"))
+    if mx:
+        b.append((f"Почтовые серверы: {', '.join(sorted(set(mx))[:3])}", "info"))
+    if not b:
+        return Report(f"Для {target} записи не найдены", "info",
+                      [("DNS не вернул адресов — проверь имя домена.", "info")])
+    return Report(f"DNS домена {target}", "info", b)
+
+
+def p_ipinfo(target, rc, lines, status):
+    try:
+        data = json.loads(_all(lines))
+    except Exception:
+        return p_generic(target, rc, lines, status)
+    b = []
+    if data.get("city") or data.get("country"):
+        loc = ", ".join(x for x in [data.get("city"), data.get("region"), data.get("country")] if x)
+        b.append((f"Местоположение: {loc}", "info"))
+    if data.get("org"):
+        b.append((f"Провайдер/владелец: {data['org']}", "info"))
+    if data.get("loc"):
+        b.append((f"Координаты: {data['loc']}", "info"))
+    if not b:
+        return p_generic(target, rc, lines, status)
+    return Report(f"Информация по IP {target}", "info", b)
+
+
+def p_exif(target, rc, lines, status):
+    txt = _all(lines)
+    gps = re.search(r"GPS Position\s*:\s*(.+)", txt)
+    model = re.search(r"Camera Model Name\s*:\s*(.+)", txt) or re.search(r"Model\s*:\s*(.+)", txt)
+    date = re.search(r"Create Date\s*:\s*(.+)", txt)
+    b = []
+    if gps:
+        b.append((f"📍 Координаты съёмки: {gps.group(1).strip()}", "warn"))
+    if model:
+        b.append((f"Камера/устройство: {model.group(1).strip()}", "info"))
+    if date:
+        b.append((f"Дата создания: {date.group(1).strip()}", "info"))
+    if not b:
+        return Report("Полезных метаданных не найдено", "info",
+                      [("В файле нет GPS/камеры — возможно, их вырезали при загрузке.", "info")])
+    lvl = "warn" if gps else "info"
+    return Report("Найдены метаданные" + (" с координатами!" if gps else ""), lvl, b)
+
+
+def p_sherlock(target, rc, lines, status):
+    found = re.findall(r"\[\+\]\s*(\S+):\s*(https?://\S+)", _all(lines))
+    if not found:
+        return Report(f"Аккаунтов с ником «{target}» не найдено", "info",
+                      [("Ни на одном из проверенных сайтов совпадений нет.", "info")])
+    b = [(f"Найдено аккаунтов: {len(found)} (возможны ложные)", "info")]
+    for site, url in found[:25]:
+        b.append((f"{site}: {url}", "info"))
+    return Report(f"Ник «{target}» встречается на {len(found)} сайтах", "info", b)
+
+
+def p_theharvester(target, rc, lines, status):
+    txt = _all(lines)
+    emails = re.findall(r"[\w.+-]+@[\w.-]+\.\w+", txt)
+    hosts = re.findall(r"\b(?:[\w-]+\.)+[\w-]+\b", txt)
+    emails = sorted(set(emails))
+    b = [(f"Найдено e-mail: {len(emails)}", "info")]
+    for e in emails[:15]:
+        b.append((e, "info"))
+    if not emails:
+        b = [("Почтовых адресов не найдено.", "info")]
+    return Report(f"Разведка по {target}", "info", b)
+
+
+def p_sublist3r(target, rc, lines, status):
+    subs = sorted(set(re.findall(rf"\b[\w-]+\.{re.escape(target)}\b", _all(lines))))
+    if not subs:
+        return Report(f"Поддоменов для {target} не найдено", "info",
+                      [("Ничего не нашлось в открытых источниках.", "info")])
+    b = [(f"Найдено поддоменов: {len(subs)}", "info")]
+    for s in subs[:25]:
+        b.append((s, "info"))
+    return Report(f"У {target} есть поддомены", "info", b)
+
+
+def p_traceroute(target, rc, lines, status):
+    hops = re.findall(r"^\s*(\d+)\s", _all(lines), re.M)
+    n = max((int(h) for h in hops), default=0)
+    if n == 0:
+        return p_generic(target, rc, lines, status)
+    return Report(f"Путь до {target}: {n} промежуточных узлов", "info",
+                  [("Полная цепочка серверов — в отчёте.", "info")])
+
+
+def p_curl_headers(target, rc, lines, status):
+    txt = _all(lines)
+    st = re.search(r"HTTP/[\d.]+\s+(\d{3})", txt)
+    server = re.search(r"^server:\s*(.+)", txt, re.I | re.M)
+    b = []
+    if st:
+        code = st.group(1)
+        meaning = {"200": "сайт работает", "301": "переадресация",
+                   "302": "переадресация", "403": "доступ запрещён",
+                   "404": "страница не найдена", "500": "ошибка сервера"}.get(code, "")
+        b.append((f"Код ответа: {code}" + (f" — {meaning}" if meaning else ""),
+                  "good" if code == "200" else "warn"))
+    if server:
+        b.append((f"Сервер: {server.group(1).strip()}", "info"))
+    if not b:
+        return p_generic(target, rc, lines, status)
+    return Report(f"Ответ сайта {target}", b[0][1], b)
+
+
+def p_whatweb(target, rc, lines, status):
+    techs = sorted(set(re.findall(r"([A-Za-z][\w-]+)\[", _all(lines))))
+    skip = {"Country", "IP", "HTTPServer"}
+    techs = [t for t in techs if t not in skip]
+    if not techs:
+        return p_generic(target, rc, lines, status)
+    return Report(f"Технологии сайта {target}", "info",
+                  [("Обнаружено: " + ", ".join(techs[:15]), "info")])
+
+
+def p_gobuster(target, rc, lines, status):
+    found = re.findall(r"(/\S+)\s+\(Status:\s*(\d+)", _all(lines))
+    if not found:
+        return Report("Скрытых страниц не найдено", "info",
+                      [("По словарю ничего живого не нашлось.", "info")])
+    b = [(f"Найдено страниц/папок: {len(found)}", "warn")]
+    for path, code in found[:25]:
+        b.append((f"{path}  (код {code})", "info"))
+    return Report(f"На {target} есть скрытые страницы", "warn", b)
+
+
+def p_nikto(target, rc, lines, status):
+    findings = [l for l in lines if l.strip().startswith("+") and "Target" not in l]
+    n = len(findings)
+    if n == 0:
+        return Report("Явных проблем не найдено", "good",
+                      [("Базовая проверка ничего очевидного не выявила.", "good")])
+    return Report(f"Найдено замечаний: {n}", "warn",
+                  [(f"nikto отметил {n} пунктов — детали в отчёте.", "warn"),
+                   ("Не все из них критичны, читай внимательно.", "info")])
+
+
+def p_wpscan(target, rc, lines, status):
+    txt = _all(lines)
+    ver = re.search(r"WordPress version\s+([\d.]+)", txt)
+    vulns = txt.count("[!]")
+    b = []
+    if ver:
+        b.append((f"Версия WordPress: {ver.group(1)}", "info"))
+    if vulns:
+        b.append((f"Отмечено предупреждений: {vulns}", "warn"))
+    if not b:
+        return p_generic(target, rc, lines, status)
+    return Report(f"Сканер WordPress: {target}", "warn" if vulns else "info", b)
+
+
+def p_iwlist(target, rc, lines, status):
+    ssids = re.findall(r'ESSID:"([^"]*)"', _all(lines))
+    enc = re.findall(r"Encryption key:(on|off)", _all(lines))
+    ssids = [s for s in ssids if s]
+    if not ssids:
+        return Report("Сетей рядом не найдено", "info",
+                      [("Возможно, адаптер выключен или нет прав.", "info")])
+    b = [(f"Найдено сетей: {len(ssids)}", "info")]
+    for i, s in enumerate(ssids[:20]):
+        lock = "🔒" if (i < len(enc) and enc[i] == "on") else "🔓"
+        b.append((f"{lock} {s}", "info"))
+    return Report(f"Вокруг {len(ssids)} Wi-Fi сетей", "info", b)
+
+
+def p_hashid(target, rc, lines, status):
+    kinds = [l.strip("[] ").strip() for l in lines if l.strip().startswith("[+]")]
+    if not kinds:
+        return p_generic(target, rc, lines, status)
+    return Report("Возможные типы хеша", "info",
+                  [(k, "info") for k in kinds[:8]])
+
+
+def p_john(target, rc, lines, status):
+    cracked = re.findall(r"(\S+)\s+\((\S+)\)", _all(lines))
+    if cracked:
+        b = [(f"Подобрано паролей: {len(cracked)}", "bad")]
+        for pw, who in cracked[:15]:
+            b.append((f"{who} → {pw}", "info"))
+        return Report("Пароли подобраны!", "bad", b)
+    return Report("Пароль пока не подобран", "info",
+                  [("По этому словарю совпадений нет. Попробуй другой словарь.", "info")])
+
+
+# ============================ ВИЗАРД NMAP ============================
+
+def ask(prompt):
+    return input(col(f"\n  {prompt}: ", C.LILAC)).strip()
+
+
+@dataclass
+class ExecSpec:
+    parts: list
+    target: str
+    parser: Callable
+    typical: str = ""
+    outfile: str = ""
+    title: str = ""
+
+
+def wiz_nmap(action):
+    target = ask("Введи IP или домен цели")
+    if not target:
+        return None
+    print(col("\n  Что хочешь узнать про цель?", C.LILAC))
+    print(col("   [1] Какие порты открыты (быстро)", C.GREY))
+    print(col("   [2] Какие программы и версии на портах", C.GREY))
+    print(col("   [3] Какая операционная система (нужен root)", C.GREY))
+    print(col("   [4] Есть ли известные уязвимости (долго)", C.GREY))
+    choice = input(col("\n  Выбор [1-4]: ", C.YELLOW)).strip()
+    base = ["nmap", "--stats-every", "2s"]
+    if choice == "1":
+        parts, parser, typ = base + ["-F", target], p_nmap_ports, "10–60 сек"
+    elif choice == "2":
+        parts, parser, typ = base + ["-sV", target], p_nmap_ports, "30–120 сек"
+    elif choice == "3":
+        parts, parser, typ = base + ["-O", target], p_nmap_os, "20–90 сек"
+        if not is_root() and shutil.which("sudo"):
+            parts = ["sudo"] + parts
+    elif choice == "4":
+        parts, parser, typ = base + ["--script", "vuln", target], p_nmap_vuln, "2–20 минут"
+    else:
+        print(col("  Нет такого варианта — отмена.", C.RED))
+        return None
+    return ExecSpec(parts=parts, target=target, parser=parser, typical=typ,
+                    title="Скан цели")
+
+
+# ============================ ЭКСПЛУАТАЦИЯ: hydra / sqlmap ============================
+# Подаются как «продвинутый ручной запуск»: показываем шаблон и разбор флагов,
+# требуем явно вписать УЧЕБНУЮ цель. Не одна кнопка «атакуй что угодно».
+
+def p_hydra(target, rc, lines, status):
+    creds = re.findall(r"login:\s*(\S+)\s+password:\s*(\S+)", _all(lines))
+    if creds:
+        b = [(f"Подобрано учётных данных: {len(creds)}", "bad")]
+        for u, p in creds[:15]:
+            b.append((f"{u} : {p}", "info"))
+        b.append(("Вот почему слабые пароли и их повторное использование опасны.", "warn"))
+        return Report("Учётные данные подобраны!", "bad", b)
+    return Report("Пароль не подобран", "info",
+                  [("По этому словарю совпадений нет — попробуй другой словарь.", "info")])
+
+
+def p_sqlmap(target, rc, lines, status):
+    t = _all(lines).lower()
+    neg = ("not injectable" in t) or ("do not appear to be injectable" in t) \
+        or ("all tested parameters do not" in t)
+    if neg:
+        return Report("SQL-инъекция не найдена", "good",
+                      [("Проверенные параметры не уязвимы.", "good")])
+    pos = ("is vulnerable" in t) or ("sqlmap identified the following injection" in t) \
+        or ("the following injection point" in t)
+    if pos:
+        dbms = re.search(r"back-end DBMS:\s*(.+)", _all(lines))
+        b = [("Параметр уязвим к SQL-инъекции.", "bad")]
+        if dbms:
+            b.append((f"База данных: {dbms.group(1).strip()}", "info"))
+        b.append(("Детали и возможности — в техническом выводе отчёта.", "info"))
+        return Report("Найдена SQL-инъекция!", "bad", b)
+    return p_generic(target, rc, lines, status)
+
+
+def _explain(template, flags):
+    print(col("\n  Шаблон команды (впиши свою учебную цель):", C.LILAC))
+    print(col(f"      {template}", C.GREEN + C.BOLD))
+    print(col("\n  Что означает каждый флаг:", C.LILAC))
+    for flag, meaning in flags:
+        print(col(f"      {flag:16}", C.PURPLE_BRIGHT) + col(meaning, C.GREY))
+
+
+def wiz_hydra(action):
+    _explain(
+        "hydra -l ЛОГИН -P СЛОВАРЬ ЦЕЛЬ СЕРВИС",
+        [("-l ЛОГИН", "один логин (или -L файл со списком логинов через @файл)"),
+         ("-P СЛОВАРЬ", "файл со списком паролей для перебора"),
+         ("ЦЕЛЬ", "IP учебной машины (HTB/THM) или своей системы"),
+         ("СЕРВИС", "что атакуем: ssh, ftp, http-post-form и т.п.")])
+    print(col("\n  Пример для HTB: hydra -l root -P rockyou.txt 10.10.10.5 ssh", C.GREY))
+
+    service = ask("Сервис (ssh / ftp / ...)")
+    target = ask("Учебная цель — IP машины HTB/THM или своей системы")
+    login = ask("Логин (или @путь/к/файлу для списка логинов)")
+    wordlist = ask("Путь к словарю паролей")
+    if not (service and target and login and wordlist):
+        print(col("  Не хватает данных — отмена.", C.GREY))
+        return None
+    login_flag = ["-L", login[1:]] if login.startswith("@") else ["-l", login]
+    parts = ["hydra"] + login_flag + ["-P", wordlist, target, service]
+    print(col("\n  Будет запущено: " + " ".join(shlex.quote(p) for p in parts), C.LILAC))
+    return ExecSpec(parts=parts, target=target, parser=p_hydra,
+                    typical="от секунд до многих минут", title="Подбор пароля (hydra)")
+
+
+def wiz_sqlmap(action):
+    _explain(
+        'sqlmap -u "URL-с-параметром" --batch',
+        [("-u URL", "адрес страницы с параметром, например http://ЦЕЛЬ/item?id=1"),
+         ("--batch", "не задавать вопросов — брать ответы по умолчанию")])
+    print(col("\n  Пример: sqlmap -u \"http://10.10.10.5/item.php?id=1\" --batch", C.GREY))
+
+    url = ask("URL учебной цели с параметром (…?id=1)")
+    if not url:
+        print(col("  Пусто — отмена.", C.GREY))
+        return None
+    parts = ["sqlmap", "-u", url, "--batch"]
+    print(col("\n  Будет запущено: " + " ".join(shlex.quote(p) for p in parts), C.LILAC))
+    return ExecSpec(parts=parts, target=url, parser=p_sqlmap,
+                    typical="1–15 минут", title="Тест SQL-инъекции (sqlmap)")
 
 
 # ============================ МОДЕЛЬ ДАННЫХ ============================
@@ -160,17 +722,19 @@ class Action:
     name: str
     desc: str
     explain: str
-    prompt: str
+    prompt: str = ""
     binary: str = ""
     install: dict = field(default_factory=dict)
     args_template: str = ""
-    func: Optional[Callable] = None
+    parser: Callable = p_generic
+    wizard: Optional[Callable] = None
+    typical: str = ""
     requires_auth: bool = False
     needs_root: bool = False
-    interactive: bool = False   # нужен живой ввод (вывод не перехватываем)
-    outfile_ext: str = ""       # если задано — {outfile} укажет на файл результата
-    default: str = ""           # значение при пустом вводе
-    timeout: int = 0            # секунд до принудительной остановки (0 = без лимита)
+    interactive: bool = False
+    outfile_ext: str = ""
+    default: str = ""
+    timeout: int = 0
     note: str = ""
 
 
@@ -179,447 +743,248 @@ class Category:
     name: str
     desc: str
     actions: list = field(default_factory=list)
+    gated: bool = False        # требует подтверждения при первом входе
+    gate_text: str = ""
 
 
-# ============================ ВСТРОЕННЫЕ ФУНКЦИИ ============================
-
-def fn_b64_encode(s):
-    return [base64.b64encode(s.encode()).decode()]
-
-
-def fn_b64_decode(s):
-    try:
-        return [base64.b64decode(s.encode()).decode(errors="replace")]
-    except Exception as e:
-        return [f"Не удалось декодировать: {e}"]
-
-
-def fn_hex_encode(s):
-    return [s.encode().hex()]
-
-
-def fn_hex_decode(s):
-    try:
-        return [bytes.fromhex(s.strip().replace(" ", "")).decode(errors="replace")]
-    except Exception as e:
-        return [f"Ошибка: {e}"]
-
-
-def fn_url_encode(s):
-    import urllib.parse
-    return [urllib.parse.quote(s)]
-
-
-def fn_url_decode(s):
-    import urllib.parse
-    return [urllib.parse.unquote(s)]
-
-
-def fn_rot13(s):
-    import codecs
-    return [codecs.encode(s, "rot_13")]
-
-
-def fn_caesar_all(s):
-    out = []
-    for k in range(1, 26):
-        r = "".join(
-            chr((ord(c) - 97 + k) % 26 + 97) if c.islower()
-            else chr((ord(c) - 65 + k) % 26 + 65) if c.isupper()
-            else c for c in s)
-        out.append(f"сдвиг {k:2}: {r}")
-    return out
-
-
-def fn_hashes(s):
-    d = s.encode()
-    return [
-        f"MD5     : {hashlib.md5(d).hexdigest()}",
-        f"SHA1    : {hashlib.sha1(d).hexdigest()}",
-        f"SHA256  : {hashlib.sha256(d).hexdigest()}",
-    ]
-
-
-def fn_file_hash(path):
-    p = Path(path)
-    if not p.is_file():
-        return [f"Файл не найден: {path}"]
-    d = p.read_bytes()
-    return [
-        f"Файл    : {p.name}  ({len(d)} байт)",
-        f"MD5     : {hashlib.md5(d).hexdigest()}",
-        f"SHA256  : {hashlib.sha256(d).hexdigest()}",
-    ]
-
-
-def fn_jwt_decode(tok):
-    parts = tok.strip().split(".")
-    if len(parts) < 2:
-        return ["Не похоже на JWT (нужны части, разделённые точками)."]
-
-    def dec(seg):
-        seg += "=" * (-len(seg) % 4)
-        return base64.urlsafe_b64decode(seg).decode(errors="replace")
-
-    try:
-        return ["HEADER:", dec(parts[0]), "", "PAYLOAD:", dec(parts[1]),
-                "", "(подпись не проверяется — только чтение содержимого)"]
-    except Exception as e:
-        return [f"Ошибка разбора: {e}"]
-
-
-def fn_gen_password(n_str):
-    import secrets, string
-    try:
-        n = int(n_str) if n_str else 20
-    except ValueError:
-        n = 20
-    n = max(8, min(n, 128))
-    alpha = string.ascii_letters + string.digits + "!@#$%^&*()-_=+"
-    return [f"Пароль ({n} символов):", "".join(secrets.choice(alpha) for _ in range(n))]
-
-
-def fn_cidr(cidr):
-    import ipaddress
-    try:
-        net = ipaddress.ip_network(cidr, strict=False)
-        hosts = list(net.hosts())
-        rng = f"{hosts[0]} — {hosts[-1]}" if hosts else "-"
-        return [
-            f"Сеть      : {net.network_address}",
-            f"Маска     : {net.netmask}",
-            f"Broadcast : {getattr(net, 'broadcast_address', '-')}",
-            f"Всего адр.: {net.num_addresses}",
-            f"Хостов    : {len(hosts)}",
-            f"Диапазон  : {rng}",
-        ]
-    except Exception as e:
-        return [f"Ошибка: {e}"]
-
-
-def fn_port_check(arg):
-    import socket
-    if ":" not in arg:
-        return ["Формат: host:port  (например example.com:443)"]
-    host, port = arg.rsplit(":", 1)
-    try:
-        port = int(port)
-    except ValueError:
-        return ["Порт должен быть числом."]
-    s = socket.socket()
-    s.settimeout(3)
-    try:
-        s.connect((host, port))
-        s.close()
-        return [f"Порт {port} на {host}: ОТКРЫТ"]
-    except Exception:
-        return [f"Порт {port} на {host}: закрыт или недоступен"]
-
-
-def fn_my_ip(_):
-    import socket
-    host = socket.gethostname()
-    try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.connect(("8.8.8.8", 80))
-        local = s.getsockname()[0]
-        s.close()
-    except Exception:
-        local = "?"
-    return [f"Имя хоста : {host}", f"Локальный IP: {local}"]
-
-
-# ============================ РЕЕСТР ИНСТРУМЕНТОВ ============================
+# ============================ НАБОР ИНСТРУМЕНТОВ (v1.0) ============================
 
 TOOLKIT = [
-    Category("Разведка (OSINT)", "Сбор информации из открытых источников", [
-        Action("Поиск по нику в соцсетях и на сайтах",
-               "Где занят такой же username (сотни сайтов).",
-               "Берёт один никнейм и проверяет сотни сайтов, где он зарегистрирован. Помогает связать аккаунты одного человека.",
+    Category("Разведка", "Узнать что-то о цели из открытых источников", [
+        Action("Кому принадлежит домен/IP", "Владелец, регистратор, дата создания.",
+               "Показывает, кто владеет доменом или адресом — как «выписка» на сайт.",
+               "Введи домен или IP", binary="whois",
+               install={"apt": "sudo apt install whois"}, args_template="{target}",
+               parser=p_whois, typical="5–15 сек"),
+        Action("Адреса и почта домена", "IP-адреса и почтовые серверы.",
+               "Куда «ведёт» домен: на каком IP сайт и через какие серверы идёт почта.",
+               "Введи домен", binary="dig",
+               install={"apt": "sudo apt install dnsutils"}, args_template="{target} ANY",
+               parser=p_dig, typical="5–10 сек"),
+        Action("Почты и поддомены компании", "Собирает контакты из открытых баз.",
+               "Ищет по домену e-mail адреса и поддомены в поисковиках. Первый шаг разведки.",
+               "Введи домен (example.com)", binary="theHarvester",
+               install={"pipx": "pipx install theHarvester"},
+               args_template="-d {target} -b duckduckgo,bing,crtsh",
+               parser=p_theharvester, typical="20–90 сек"),
+        Action("Все поддомены сайта", "Находит скрытые поддомены.",
+               "Ищет адреса вида mail.site.com, dev.site.com — часто самое интересное там.",
+               "Введи домен", binary="sublist3r",
+               install={"pipx": "pipx install sublist3r"}, args_template="-d {target}",
+               parser=p_sublist3r, typical="30–120 сек"),
+        Action("Где находится IP", "Страна, город, провайдер по адресу.",
+               "По IP показывает примерное местоположение и чей это провайдер.",
+               "Введи IP-адрес", binary="curl",
+               install={"apt": "sudo apt install curl"},
+               args_template="-s https://ipinfo.io/{target}",
+               parser=p_ipinfo, typical="5 сек"),
+        Action("Что спрятано в фото/файле", "Метаданные и GPS-координаты.",
+               "Достаёт скрытые данные: камеру, дату и часто координаты, где сделано фото.",
+               "Введи путь к файлу (photo.jpg)", binary="exiftool",
+               install={"apt": "sudo apt install libimage-exiftool-perl"},
+               args_template="{target}", parser=p_exif, typical="5 сек"),
+        Action("Найти ник в соцсетях", "Где занят такой же username.",
+               "Проверяет сотни сайтов: где зарегистрирован такой никнейм.",
                "Введи никнейм", binary="sherlock",
                install={"pipx": "pipx install sherlock-project"}, args_template="{target}",
-               note="Возможны ложные совпадения — проверяй вручную."),
-        Action("Почты и поддомены по домену",
-               "Собирает e-mail и поддомены из открытых баз.",
-               "По домену ищет почтовые адреса и поддомены в поисковиках и публичных базах. Классика первого этапа разведки.",
-               "Введи домен (example.com)", binary="theHarvester",
-               install={"pipx": "pipx install theHarvester"}, args_template="-d {target} -b duckduckgo,bing,crtsh"),
-        Action("Все поддомены сайта",
-               "Перебирает и находит поддомены домена.",
-               "Ищет скрытые поддомены вида mail.site.com, dev.site.com. Часто именно на забытых поддоменах и находят проблемы.",
-               "Введи домен", binary="sublist3r",
-               install={"pipx": "pipx install sublist3r", "apt": "sudo apt install sublist3r"}, args_template="-d {target}"),
-        Action("Глубокая разведка DNS (dnsrecon)",
-               "Расширенный сбор DNS-записей и зон.",
-               "Собирает из DNS максимум: записи, зоны, поддомены. Более подробно, чем обычный запрос.",
-               "Введи домен", binary="dnsrecon",
-               install={"apt": "sudo apt install dnsrecon"}, args_template="-d {target}"),
-        Action("Перечисление DNS (dnsenum)",
-               "Другой инструмент разведки DNS.",
-               "Ещё один сборщик DNS-информации: записи, поддомены, диапазоны. Полезно сравнить результаты с dnsrecon.",
-               "Введи домен", binary="dnsenum",
-               install={"apt": "sudo apt install dnsenum"}, args_template="{target}"),
-        Action("Разведка DNS (fierce)",
-               "Ищет поддомены и соседние сети.",
-               "Прощупывает DNS домена и находит поддомены и связанные диапазоны IP.",
-               "Введи домен", binary="fierce",
-               install={"apt": "sudo apt install fierce"}, args_template="--domain {target}"),
-        Action("Кому принадлежит домен или IP (WHOIS)",
-               "Регистрационные данные домена/IP.",
-               "Показывает, кто зарегистрировал домен или владеет диапазоном IP: организация, даты, контакты.",
-               "Введи домен или IP", binary="whois",
-               install={"apt": "sudo apt install whois", "pacman": "sudo pacman -S whois"}, args_template="{target}"),
-        Action("DNS-записи домена (dig)",
-               "Показывает A, MX, NS и другие записи.",
-               "«Адресная книга» домена: где хостится сайт (A), куда идёт почта (MX), какие серверы имён (NS).",
-               "Введи домен", binary="dig",
-               install={"apt": "sudo apt install dnsutils", "dnf": "sudo dnf install bind-utils"}, args_template="{target} ANY"),
-        Action("Быстрый DNS-запрос (host)",
-               "Простой перевод домена в IP и обратно.",
-               "Самый простой способ узнать IP домена или домен по IP. Быстро и без лишнего.",
-               "Введи домен или IP", binary="host",
-               install={"apt": "sudo apt install dnsutils"}, args_template="{target}"),
-        Action("Информация и гео по IP-адресу",
-               "Страна, город, провайдер по IP.",
-               "Запрашивает публичный сервис ipinfo.io и показывает примерное местоположение и провайдера IP.",
-               "Введи IP-адрес", binary="curl",
-               install={"apt": "sudo apt install curl"}, args_template="-s https://ipinfo.io/{target}"),
-        Action("Метаданные и GPS из файла (EXIF)",
-               "Достаёт скрытые данные из фото/файла.",
-               "Читает скрытые метаданные: модель камеры, дату и часто GPS-координаты съёмки. Это простой GEOINT.",
-               "Введи путь к файлу (photo.jpg)", binary="exiftool",
-               install={"apt": "sudo apt install libimage-exiftool-perl"}, args_template="{target}",
-               note="GPS будет только если он реально записан — соцсети часто вырезают его."),
-        Action("Определить веб-файрвол (wafw00f)",
-               "Проверяет, стоит ли перед сайтом WAF.",
-               "Определяет, защищён ли сайт веб-файрволом (Cloudflare и т.п.). Полезно понимать до любых веб-проверок.",
-               "Введи URL сайта", binary="wafw00f",
-               install={"apt": "sudo apt install wafw00f", "pipx": "pipx install wafw00f"}, args_template="{target}",
-               requires_auth=True),
-        Action("Собрать словарь со страницы (cewl)",
-               "Делает список слов из текста сайта.",
-               "Скачивает текст сайта и собирает из него список слов — их потом используют как словарь паролей/каталогов.",
-               "Введи URL сайта", binary="cewl",
-               install={"apt": "sudo apt install cewl"}, args_template="{target}", requires_auth=True),
+               parser=p_sherlock, typical="1–3 минуты"),
     ]),
 
-    Category("Сеть", "Изучение хостов и открытых портов", [
-        Action("Доступен ли хост (ping)",
-               "Жив ли компьютер и как быстро отвечает.",
-               "Отправляет 4 коротких сигнала и смотрит, отвечает ли машина. Первый вопрос: «цель вообще онлайн?».",
+    Category("Сеть", "Проверить хост и сеть", [
+        Action("Доступен ли хост", "Отвечает ли машина и как быстро.",
+               "Простой вопрос: «эта цель сейчас онлайн и на связи?».",
                "Введи IP или домен", binary="ping",
-               install={"apt": "sudo apt install iputils-ping"}, args_template="-c 4 {target}"),
-        Action("Найти живые устройства в сети (nmap)",
-               "Сканирует подсеть, показывает активные хосты.",
-               "По диапазону адресов находит все включённые устройства. Так составляют карту локальной сети.",
-               "Введи подсеть (192.168.1.0/24)", binary="nmap",
-               install={"apt": "sudo apt install nmap"}, args_template="-sn {target}", requires_auth=True),
-        Action("Устройства в сети по ARP (arp-scan)",
-               "Находит соседей по локальной сети.",
-               "Рассылает ARP-запросы и находит устройства в твоей локальной сети вместе с их MAC-адресами.",
-               "", binary="arp-scan",
-               install={"apt": "sudo apt install arp-scan"}, args_template="--localnet",
-               needs_root=True, requires_auth=True),
-        Action("Быстрое сканирование портов (nmap)",
-               "Самые частые открытые порты цели.",
-               "Проверяет 100 популярных портов: какие «двери» у цели открыты (сайт, почта, SSH).",
-               "Введи IP или домен", binary="nmap",
-               install={"apt": "sudo apt install nmap"}, args_template="-F {target}", requires_auth=True),
-        Action("Сервисы и версии на портах (nmap)",
-               "Что за программы слушают и какие версии.",
-               "Не просто «порт открыт», а какая программа и версия за ним. По версии видно известные уязвимости.",
-               "Введи IP или домен", binary="nmap",
-               install={"apt": "sudo apt install nmap"}, args_template="-sV {target}", requires_auth=True),
-        Action("Определить ОС цели (nmap)",
-               "Угадывает операционную систему.",
-               "По особенностям сетевых ответов пытается понять, Windows это, Linux или другое. Нужен root.",
-               "Введи IP цели", binary="nmap",
-               install={"apt": "sudo apt install nmap"}, args_template="-O {target}",
-               requires_auth=True, needs_root=True),
-        Action("Проверка на известные уязвимости (nmap)",
-               "Запускает скрипты поиска уязвимостей.",
-               "Гоняет встроенные nmap-скрипты категории vuln и отмечает известные проблемы на открытых сервисах.",
-               "Введи IP или домен", binary="nmap",
-               install={"apt": "sudo apt install nmap"}, args_template="--script vuln {target}", requires_auth=True, timeout=1800),
-        Action("Очень быстрый скан портов (masscan)",
-               "Сканирует порты на большой скорости.",
-               "Просматривает диапазон портов гораздо быстрее nmap. Хорош для больших сетей. Нужен root.",
-               "Введи IP или подсеть", binary="masscan",
-               install={"apt": "sudo apt install masscan"}, args_template="-p1-1000 {target} --rate 1000",
-               requires_auth=True, needs_root=True, timeout=600, note="Высокая скорость создаёт заметную нагрузку — только по своим целям."),
-        Action("Маршрут до хоста (traceroute)",
-               "Через какие узлы идёт путь до цели.",
-               "Показывает цепочку промежуточных серверов между тобой и целью. Видно, где теряется связь.",
+               install={"apt": "sudo apt install iputils-ping"},
+               args_template="-c 4 {target}", parser=p_ping, typical="5–15 сек"),
+        Action("Проверить цель (умный скан)", "Мастер: сам подберёт настройки nmap.",
+               "Спросит, что ты хочешь узнать, и сам настроит сканирование цели.",
+               binary="nmap", install={"apt": "sudo apt install nmap"},
+               wizard=wiz_nmap, requires_auth=True, timeout=1800),
+        Action("Кто есть в моей сети", "Список активных устройств рядом.",
+               "Показывает все включённые устройства в указанной локальной сети.",
+               "Введи сеть (192.168.1.0/24)", binary="nmap",
+               install={"apt": "sudo apt install nmap"}, args_template="-sn {target}",
+               parser=p_nmap_hosts, requires_auth=True, typical="10–40 сек"),
+        Action("Путь до сайта", "Через какие узлы идёт соединение.",
+               "Показывает цепочку серверов между тобой и целью.",
                "Введи IP или домен", binary="traceroute",
-               install={"apt": "sudo apt install traceroute"}, args_template="{target}"),
-        Action("Перехват трафика → файл для Wireshark",
-               "Записывает пакеты в .pcap.",
-               "Ловит 200 сетевых пакетов на интерфейсе и сохраняет их в .pcap — этот файл открывается в Wireshark. Нужен root.",
+               install={"apt": "sudo apt install traceroute"}, args_template="{target}",
+               parser=p_traceroute, typical="10–30 сек"),
+        Action("Записать трафик для Wireshark", "Сохраняет 200 пакетов в .pcap.",
+               "Ловит сетевые пакеты и сохраняет в файл, который открывается в Wireshark.",
                "Интерфейс (Enter = any)", binary="tcpdump",
-               install={"apt": "sudo apt install tcpdump"}, args_template="-i {target} -c 200 -w {outfile}",
-               needs_root=True, outfile_ext="pcap", default="any",
-               note="Открой полученный .pcap в Wireshark для анализа."),
-        Action("Мои открытые порты (ss)",
-               "Что слушает на твоём компьютере.",
-               "Показывает, какие порты открыты на ЭТОЙ машине и какие программы их слушают. Полностью безопасно.",
-               "", binary="ss",
-               install={"apt": "sudo apt install iproute2"}, args_template="-tuln"),
+               install={"apt": "sudo apt install tcpdump"},
+               args_template="-i {target} -c 200 -w {outfile}",
+               parser=p_generic, needs_root=True, outfile_ext="pcap", default="any",
+               typical="зависит от трафика"),
     ]),
 
-    Category("Веб", "Изучение веб-сайтов", [
-        Action("HTTP-заголовки сайта (curl)",
-               "Служебные заголовки ответа сервера.",
-               "Показывает, что сервер сообщает о себе: тип, редиректы, cookies. Быстро прощупать сайт, ничего не ломая.",
+    Category("Веб", "Изучить сайт", [
+        Action("Как отвечает сайт", "Код ответа и тип сервера.",
+               "Прощупывает сайт: работает ли он, что за сервер — ничего не ломая.",
                "Введи URL (https://example.com)", binary="curl",
-               install={"apt": "sudo apt install curl"}, args_template="-I {target}", requires_auth=True),
-        Action("Определить технологии сайта (whatweb)",
-               "CMS, сервер, библиотеки сайта.",
-               "Определяет, на чём сделан сайт: WordPress, веб-сервер, библиотеки. С этого выбирают, что проверять дальше.",
+               install={"apt": "sudo apt install curl"}, args_template="-I {target}",
+               parser=p_curl_headers, requires_auth=True, typical="5 сек"),
+        Action("На чём сделан сайт", "CMS, сервер, библиотеки.",
+               "Определяет технологии сайта: WordPress, сервер и прочее.",
                "Введи URL или домен", binary="whatweb",
-               install={"apt": "sudo apt install whatweb"}, args_template="{target}", requires_auth=True),
-        Action("Поиск скрытых страниц (gobuster)",
-               "Перебирает пути, находит скрытые страницы.",
-               "По словарю проверяет тысячи адресов (/admin, /backup) и показывает реально существующие.",
+               install={"apt": "sudo apt install whatweb"}, args_template="{target}",
+               parser=p_whatweb, requires_auth=True, typical="10–30 сек"),
+        Action("Найти скрытые страницы", "Ищет непубличные адреса сайта.",
+               "По словарю проверяет тысячи адресов (/admin, /backup) и находит существующие.",
                "Введи URL сайта", binary="gobuster",
                install={"apt": "sudo apt install gobuster"},
                args_template="dir -u {target} -w /usr/share/wordlists/dirb/common.txt",
-               requires_auth=True, timeout=900, note="Словарь по указанному пути есть на Kali; на другой ОС укажи свой."),
-        Action("Поиск папок (dirb)",
-               "Классический перебор директорий.",
-               "Похоже на gobuster, но со встроенным словарём. Простой запуск без указания словаря.",
-               "Введи URL сайта", binary="dirb",
-               install={"apt": "sudo apt install dirb"}, args_template="{target}", requires_auth=True, timeout=900),
-        Action("Фаззинг адресов (ffuf)",
-               "Быстро подбирает пути и параметры.",
-               "Очень быстрый инструмент: подставляет слова из словаря в адрес и ищет живые страницы.",
-               "Введи URL с FUZZ (site.com/FUZZ)", binary="ffuf",
-               install={"apt": "sudo apt install ffuf"},
-               args_template="-u {target} -w /usr/share/wordlists/dirb/common.txt",
-               requires_auth=True, timeout=900, note="В адресе укажи слово FUZZ там, где подставлять слова."),
-        Action("Базовая проверка сайта (nikto)",
-               "Ищет типовые уязвимости и мисконфиги.",
-               "Проверяет сайт по большому списку известных проблем и устаревших файлов. Хороший обзорный скан.",
+               parser=p_gobuster, requires_auth=True, timeout=900, typical="1–10 минут",
+               note="Словарь по этому пути есть на Kali; на другой ОС укажи свой."),
+        Action("Базовая проверка сайта", "Ищет типовые проблемы и мисконфиги.",
+               "Проверяет сайт по списку известных проблем. Обзорный скан.",
                "Введи URL сайта", binary="nikto",
-               install={"apt": "sudo apt install nikto"}, args_template="-h {target}", requires_auth=True, timeout=1200),
-        Action("Сканер WordPress (wpscan)",
-               "Плагины, темы и их известные проблемы.",
-               "Если сайт на WordPress — находит версии темы и плагинов и сверяет с базой уязвимостей.",
+               install={"apt": "sudo apt install nikto"}, args_template="-h {target}",
+               parser=p_nikto, requires_auth=True, timeout=1200, typical="2–15 минут"),
+        Action("Проверить WordPress", "Версии, плагины и их проблемы.",
+               "Если сайт на WordPress — сверяет версии темы и плагинов с базой уязвимостей.",
                "Введи URL WordPress-сайта", binary="wpscan",
-               install={"apt": "sudo apt install wpscan"}, args_template="--url {target}", requires_auth=True, timeout=1200),
-        Action("Шаблонный поиск уязвимостей (nuclei)",
-               "Проверяет сайт по базе шаблонов.",
-               "Современный сканер: гоняет тысячи готовых шаблонов известных уязвимостей и мисконфигов.",
-               "Введи URL сайта", binary="nuclei",
-               install={"apt": "sudo apt install nuclei"}, args_template="-u {target}", requires_auth=True, timeout=1800),
-        Action("Тест SQL-инъекций (sqlmap)",
-               "Проверяет параметры на SQL-инъекции.",
-               "Стандартный инструмент проверки на SQL-инъекции. Мощный и активный — только по своим/учебным целям.",
-               "Введи URL с параметром (?id=1)", binary="sqlmap",
-               install={"apt": "sudo apt install sqlmap"}, args_template="-u {target} --batch",
-               requires_auth=True, timeout=1800, note="Активно взаимодействует с БД сайта. Запуск только с разрешения."),
+               install={"apt": "sudo apt install wpscan"}, args_template="--url {target}",
+               parser=p_wpscan, requires_auth=True, timeout=1200, typical="1–10 минут"),
     ]),
 
-    Category("Wi-Fi", "Аудит беспроводных сетей (только с разрешения!)", [
-        Action("Показать Wi-Fi сети рядом (iwlist)",
-               "Список доступных беспроводных сетей.",
-               "Сканирует эфир и показывает сети вокруг: имена, каналы, тип защиты. Просто осмотреться.",
+    Category("Wi-Fi", "Беспроводные сети (только с разрешения!)", [
+        Action("Показать сети рядом", "Список Wi-Fi вокруг и их защита.",
+               "Сканирует эфир и показывает сети: имена и есть ли пароль.",
                "", binary="iwlist",
-               install={"apt": "sudo apt install wireless-tools"}, args_template="scanning", needs_root=True),
-        Action("Аудит защищённости Wi-Fi (wifite)",
-               "Проверяет стойкость ближайших сетей.",
-               "Комбайн для проверки Wi-Fi. Запускать можно ТОЛЬКО на своей сети. Нужен адаптер с режимом мониторинга.",
-               "", binary="wifite",
-               install={"apt": "sudo apt install wifite"}, args_template="",
-               requires_auth=True, needs_root=True, interactive=True,
-               note="Интерактивный инструмент — вывод не сохраняется в файл."),
+               install={"apt": "sudo apt install wireless-tools"},
+               args_template="scanning", parser=p_iwlist, needs_root=True, typical="5–15 сек"),
+        Action("Аудит своей Wi-Fi сети", "Проверка стойкости защиты.",
+               "Комбайн для проверки Wi-Fi. Запускать ТОЛЬКО на своей сети. Нужен спец. адаптер.",
+               "", binary="wifite", install={"apt": "sudo apt install wifite"},
+               args_template="", requires_auth=True, needs_root=True, interactive=True,
+               note="Интерактивный инструмент — работает в своём окне, отчёт не формируется."),
     ]),
 
-    Category("Хеши, пароли и CTF", "Работа с хешами и файлами (легально: свои/CTF)", [
-        Action("Определить тип хеша (hashid)",
-               "Подсказывает, что это за хеш.",
-               "По виду строки угадывает алгоритм (MD5, SHA1, bcrypt). Нужно, чтобы понять, чем такой хеш подбирать.",
+    Category("Хеши и пароли", "Работа с хешами (свои / CTF)", [
+        Action("Что это за хеш", "Определяет тип хеша.",
+               "По виду строки угадывает алгоритм — чтобы понять, чем его подбирать.",
                "Введи хеш", binary="hashid",
-               install={"pipx": "pipx install hashid", "apt": "sudo apt install hashid"}, args_template="{target}"),
-        Action("Подобрать пароль к хешу (john)",
-               "Перебор пароля по словарю.",
-               "Берёт файл с хешами и словарь, ищет совпадения. Легально — только для своих хешей и CTF.",
+               install={"pipx": "pipx install hashid"}, args_template="{target}",
+               parser=p_hashid, typical="1 сек"),
+        Action("Подобрать пароль к хешу", "Перебор по словарю (свои/CTF).",
+               "Берёт файл с хешами и словарь, ищет совпадения. Только для своих хешей и CTF.",
                "Введи путь к файлу с хешами", binary="john",
                install={"apt": "sudo apt install john"},
                args_template="--wordlist=/usr/share/wordlists/rockyou.txt {target}",
-               requires_auth=True, note="Словарь rockyou.txt есть на Kali (иногда как .gz — распакуй)."),
-        Action("Читаемые строки из файла (strings)",
-               "Достаёт текст из любого файла.",
-               "Вытаскивает все читаемые строки из бинарного файла или дампа. Первое, что делают в CTF с непонятным файлом.",
-               "Введи путь к файлу", binary="strings",
-               install={"apt": "sudo apt install binutils"}, args_template="{target}"),
-        Action("Анализ файла на вложения (binwalk)",
-               "Ищет спрятанные файлы внутри файла.",
-               "Просматривает файл (образ, картинку) и находит внутри другие файлы и сжатые данные. Классика CTF.",
-               "Введи путь к файлу", binary="binwalk",
-               install={"apt": "sudo apt install binwalk"}, args_template="{target}"),
-        Action("Извлечь скрытое из картинки (steghide)",
-               "Достаёт данные, спрятанные в изображении.",
-               "Пытается извлечь данные, спрятанные в картинке/аудио методом стеганографии. Спросит пароль.",
-               "Введи путь к файлу", binary="steghide",
-               install={"apt": "sudo apt install steghide"}, args_template="extract -sf {target}",
-               interactive=True, note="Интерактивно спросит пароль — вывод не сохраняется."),
+               parser=p_john, requires_auth=True, timeout=900, typical="от секунд до минут",
+               note="Словарь rockyou.txt есть на Kali (иногда как .gz — распакуй)."),
     ]),
 
-    Category("Утилиты", "Встроенные функции — работают без установки", [
-        Action("Base64: закодировать", "Текст → Base64.",
-               "Превращает обычный текст в Base64. Часто нужно с токенами и веб-запросами.",
-               "Введи текст", func=fn_b64_encode),
-        Action("Base64: раскодировать", "Base64 → текст.",
-               "Обратное действие: Base64 назад в читаемый текст.",
-               "Введи строку Base64", func=fn_b64_decode),
-        Action("HEX: закодировать", "Текст → шестнадцатеричный вид.",
-               "Переводит текст в hex-представление байтов. Пригодится в реверсе и веб-задачах.",
-               "Введи текст", func=fn_hex_encode),
-        Action("HEX: раскодировать", "HEX → текст.",
-               "Переводит hex-строку обратно в текст.",
-               "Введи hex-строку", func=fn_hex_decode),
-        Action("URL: закодировать", "Текст → безопасный для URL вид.",
-               "Экранирует спецсимволы, чтобы строку можно было вставить в адрес.",
-               "Введи текст", func=fn_url_encode),
-        Action("URL: раскодировать", "URL-строка → обычный текст.",
-               "Возвращает %20 и подобное обратно в нормальные символы.",
-               "Введи URL-строку", func=fn_url_decode),
-        Action("ROT13", "Простой шифр сдвига на 13.",
-               "Сдвигает каждую букву на 13 позиций. Классическая CTF-разминка.",
-               "Введи текст", func=fn_rot13),
-        Action("Шифр Цезаря: все сдвиги", "Показывает все 25 вариантов.",
-               "Выводит текст при всех сдвигах 1–25 — глазами находишь читаемый. Частая CTF-задача.",
-               "Введи текст", func=fn_caesar_all),
-        Action("Хеши строки", "MD5, SHA1 и SHA256 текста.",
-               "Считает три популярных хеша от введённого текста.",
-               "Введи текст", func=fn_hashes),
-        Action("Хеш файла", "MD5 и SHA256 файла.",
-               "Считает хеши файла — так проверяют, что скачанное не подменили.",
-               "Введи путь к файлу", func=fn_file_hash),
-        Action("Декодер JWT", "Читает содержимое JWT-токена.",
-               "Разбирает JWT и показывает header и payload. Подпись не проверяет — только чтение.",
-               "Введи JWT-токен", func=fn_jwt_decode),
-        Action("Генератор пароля", "Надёжный случайный пароль.",
-               "Создаёт криптостойкий случайный пароль. Укажи длину или оставь пусто (20).",
-               "Длина (Enter = 20)", func=fn_gen_password),
-        Action("Калькулятор подсети (CIDR)", "Диапазон адресов по маске.",
-               "По записи вида 192.168.1.0/24 показывает маску, broadcast и диапазон хостов.",
-               "Введи подсеть (192.168.1.0/24)", func=fn_cidr),
-        Action("Проверить один порт", "Открыт ли порт на хосте.",
-               "Пробует подключиться к одному порту и говорит, открыт он или нет.",
-               "Введи host:port", func=fn_port_check, requires_auth=True),
-        Action("Мой IP и хост", "Локальный адрес этой машины.",
-               "Показывает имя хоста и локальный IP твоего компьютера. Безопасно.",
-               "", func=fn_my_ip),
+    Category("Эксплуатация", "Активные инструменты — ТОЛЬКО полигоны и CTF",
+             gated=True,
+             gate_text=(
+                 "Здесь инструменты, которые атакуют цель напрямую: подбор паролей "
+                 "и SQL-инъекции. Применять их к чужим системам без письменного "
+                 "разрешения — уголовное преступление.\n"
+                 "  Запускай ТОЛЬКО на учебных площадках (HackTheBox, TryHackMe, "
+                 "DVWA) или на своих системах."),
+             actions=[
+        Action("Подбор пароля к сервису (hydra)", "Ручной запуск с разбором флагов.",
+               "Перебирает пароли к сервису (ssh, ftp, веб-формы). Покажу шаблон и "
+               "объясню каждый флаг — цель вписываешь сам.",
+               binary="hydra", install={"apt": "sudo apt install hydra"},
+               wizard=wiz_hydra, requires_auth=True, timeout=1800),
+        Action("Тест SQL-инъекции (sqlmap)", "Ручной запуск с разбором флагов.",
+               "Проверяет параметр сайта на SQL-инъекцию. Покажу шаблон и объясню "
+               "флаги — URL учебной цели вписываешь сам.",
+               binary="sqlmap", install={"apt": "sudo apt install sqlmap"},
+               wizard=wiz_sqlmap, requires_auth=True, timeout=1800),
     ]),
 ]
 
 
-# ============================ СБОР РЕЗУЛЬТАТОВ ============================
+# ============================ РЕЗУЛЬТАТЫ / HTML ============================
 
 RESULTS_DIR = Path.home() / ".voker" / "results"
 SESSION = []
 SESSION_ID = time.strftime("%Y%m%d_%H%M%S")
+
+LEVEL_HTML = {"good": ("#3ad29f", "✅"), "info": ("#b39ddb", "ℹ️"),
+              "warn": ("#ffd166", "⚠️"), "bad": ("#ef5350", "❌")}
+
+HTML_CSS = """
+:root{color-scheme:dark}
+*{box-sizing:border-box}
+body{margin:0;font-family:system-ui,Segoe UI,Roboto,sans-serif;
+background:#14101c;color:#e8e3f0;padding:24px}
+.wrap{max-width:820px;margin:0 auto}
+.head{display:flex;justify-content:space-between;align-items:center;margin-bottom:20px}
+.logo{font-size:22px;font-weight:700;color:#b39ddb}
+.ts{color:#8a80a0;font-size:13px}
+.verdict{display:flex;gap:16px;align-items:center;background:#1e1830;
+border-left:6px solid #b39ddb;border-radius:12px;padding:18px 20px;margin-bottom:18px}
+.verdict .emoji{font-size:34px}
+.hl{font-size:20px;font-weight:700}
+.sub{color:#9b90b5;font-size:14px;margin-top:4px}
+ul.bul{list-style:none;padding:0;margin:0 0 18px}
+ul.bul li{background:#1a1526;border-radius:8px;padding:10px 14px;margin-bottom:8px;
+border-left:3px solid #6c5b8c}
+ul.bul li.warn{border-left-color:#ffd166}
+ul.bul li.bad{border-left-color:#ef5350}
+ul.bul li.good{border-left-color:#3ad29f}
+details{background:#1a1526;border-radius:8px;padding:12px 14px;margin-bottom:18px}
+summary{cursor:pointer;color:#b39ddb}
+pre{overflow-x:auto;color:#c9c0dc;font-size:13px;white-space:pre-wrap;margin:12px 0 0}
+.meta{color:#8a80a0;font-size:13px;margin-bottom:10px}
+.meta code{background:#231b34;padding:2px 6px;border-radius:5px;color:#cbb8ea}
+.foot{color:#6f6588;font-size:12px;border-top:1px solid #2a2340;padding-top:12px;margin-top:20px}
+"""
+
+
+def _html_report(action, spec, rc, status, rep, ts):
+    color, emoji = LEVEL_HTML.get(rep.level, LEVEL_HTML["info"])
+    bullets = "".join(
+        f'<li class="{lvl}">{html.escape(t)}</li>' for t, lvl in rep.bullets
+    ) or "<li>Нет данных</li>"
+    raw = html.escape("\n".join(rep.raw_lines)) or "(вывод пуст)"
+    cmd = html.escape(" ".join(shlex.quote(p) for p in spec.parts))
+    return f"""<!doctype html>
+<html lang="ru"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Voker — {html.escape(action.name)}</title><style>{HTML_CSS}</style></head>
+<body><div class="wrap">
+<div class="head"><span class="logo">💜 Voker</span><span class="ts">{ts}</span></div>
+<div class="verdict" style="border-left-color:{color}">
+  <div class="emoji">{emoji}</div>
+  <div><div class="hl">{html.escape(rep.headline)}</div>
+  <div class="sub">{html.escape(action.name)} · цель: {html.escape(spec.target or '—')}</div></div>
+</div>
+<ul class="bul">{bullets}</ul>
+<details><summary>Показать технический вывод</summary><pre>{raw}</pre></details>
+<div class="meta">Команда: <code>{cmd}</code><br>Код: {rc} · Статус: {status}</div>
+<div class="foot">Voker · только для легального использования с разрешения владельца цели</div>
+</div></body></html>"""
+
+
+def save_result(action, spec, rc, status, rep):
+    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    ts = time.strftime("%Y-%m-%d %H:%M:%S")
+    stamp = time.strftime("%Y%m%d_%H%M%S")
+    base = f"{stamp}_{slug(action.binary or action.name)}_{slug(spec.target)}"
+
+    txt = RESULTS_DIR / f"{base}.txt"
+    txt.write_text(
+        f"{action.name} | цель: {spec.target} | статус: {status} | код: {rc}\n"
+        + "-" * 50 + "\n" + "\n".join(rep.raw_lines) + "\n", encoding="utf-8")
+
+    htmlf = RESULTS_DIR / f"{base}.html"
+    htmlf.write_text(_html_report(action, spec, rc, status, rep, ts), encoding="utf-8")
+
+    SESSION.append({
+        "time": stamp, "name": action.name, "target": spec.target or "-",
+        "status": status, "headline": rep.headline, "level": rep.level,
+        "bullets": rep.bullets, "html": str(htmlf), "txt": str(txt),
+    })
+    js = RESULTS_DIR / f"session_{SESSION_ID}.json"
+    js.write_text(json.dumps(SESSION, ensure_ascii=False, indent=2), encoding="utf-8")
+    return txt, htmlf
 
 
 def slug(s):
@@ -627,48 +992,41 @@ def slug(s):
     return s[:40] or "none"
 
 
-def save_result(action, target, cmd_str, returncode, lines, artifact=None, status="ok"):
-    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-    ts = time.strftime("%Y%m%d_%H%M%S")
-    base = f"{ts}_{slug(action.binary or action.name)}_{slug(target)}"
-    txt = RESULTS_DIR / f"{base}.txt"
-    header = [
-        "Voker — результат команды",
-        f"Пункт   : {action.name}",
-        f"Цель    : {target or '-'}",
-        f"Команда : {cmd_str}",
-        f"Код     : {returncode}",
-        f"Статус  : {status}",
-        f"Время   : {ts}",
-        "-" * 50,
-    ]
-    txt.write_text("\n".join(header + lines) + "\n", encoding="utf-8")
-
-    entry = {
-        "time": ts, "name": action.name, "tool": action.binary or "built-in",
-        "target": target, "command": cmd_str, "exit_code": returncode,
-        "status": status, "lines": len(lines), "txt_file": str(txt),
-    }
-    if artifact:
-        entry["artifact"] = str(artifact)
-    SESSION.append(entry)
-    js = RESULTS_DIR / f"session_{SESSION_ID}.json"
-    js.write_text(json.dumps(SESSION, ensure_ascii=False, indent=2), encoding="utf-8")
-    return txt, js
-
-
 def show_session_table():
     if not SESSION:
-        rail(["Пока ничего не собрано."])
+        print(col("  Пока ничего не собрано.", C.GREY))
         return
-    headers = ["Время", "Пункт", "Цель", "Статус", "Стр."]
-    rows = [[e["time"][-6:], e["name"], e["target"] or "-",
-             e.get("status", "ok"), str(e["lines"])] for e in SESSION]
-    print_table(headers, rows, caps=[8, 34, 24, 11, 5])
-    print(col(f"  Полные результаты: {RESULTS_DIR}", C.GREY))
+    rows = [[e["time"][-6:], e["name"], e["target"], e["status"]] for e in SESSION]
+    print_table(["Время", "Что делали", "Цель", "Статус"], rows, caps=[8, 32, 24, 11])
+    print(col(f"  Отчёты (HTML) лежат в: {RESULTS_DIR}", C.GREY))
 
 
-# ============================ ЗАПУСК КОМАНД ============================
+def build_session_html():
+    if not SESSION:
+        return None
+    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    cards = ""
+    for e in SESSION:
+        color, emoji = LEVEL_HTML.get(e["level"], LEVEL_HTML["info"])
+        bl = "".join(f'<li class="{lvl}">{html.escape(t)}</li>' for t, lvl in e["bullets"])
+        cards += f"""<div class="verdict" style="border-left-color:{color}">
+<div class="emoji">{emoji}</div><div><div class="hl">{html.escape(e['headline'])}</div>
+<div class="sub">{html.escape(e['name'])} · цель: {html.escape(e['target'])} · {e['time'][-6:]}</div>
+</div></div><ul class="bul">{bl}</ul>"""
+    ts = time.strftime("%Y-%m-%d %H:%M")
+    doc = f"""<!doctype html><html lang="ru"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Voker — отчёт сессии</title><style>{HTML_CSS}</style></head>
+<body><div class="wrap"><div class="head"><span class="logo">💜 Voker · отчёт сессии</span>
+<span class="ts">{ts}</span></div>{cards}
+<div class="foot">Voker · только для легального использования с разрешения владельца</div>
+</div></body></html>"""
+    path = RESULTS_DIR / f"session_{SESSION_ID}.html"
+    path.write_text(doc, encoding="utf-8")
+    return path
+
+
+# ============================ ЗАПУСК ============================
 
 def detect_pkg_manager():
     for pm in ("apt", "pacman", "dnf", "yum", "brew"):
@@ -693,185 +1051,111 @@ def show_install_help(action):
             chosen += "   (сначала: sudo apt install pipx)"
     if not chosen and action.install:
         chosen = next(iter(action.install.values()))
-    print(col("  Установи его так:", C.LILAC))
+    print(col("  Установи так:", C.LILAC))
     print(col(f"      {chosen}", C.GREEN + C.BOLD))
-    if len(action.install) > 1:
-        print(col("  Другие варианты: " + ", ".join(f"{k}: {v}" for k, v in action.install.items()), C.GREY))
-    print(col("  После установки выбери пункт снова.\n", C.GREY))
+    print(col("  Потом выбери пункт снова.\n", C.GREY))
 
 
 def build_parts(action, target, outfile=""):
-    arg_str = action.args_template
-    if arg_str:
-        arg_str = arg_str.format(target=target, outfile=outfile)
+    arg_str = action.args_template.format(target=target, outfile=outfile) if action.args_template else ""
     parts = [action.binary] + (shlex.split(arg_str) if arg_str else [])
     if action.needs_root and not is_root() and shutil.which("sudo"):
         parts = ["sudo"] + parts
     return parts
 
 
-def run_and_capture(parts, timeout=0):
-    """Запускает процесс, стримит вывод и собирает его.
-    Возвращает (код, строки, статус). Статус: ok | timeout | interrupted | error.
-    При таймауте/прерывании процесс убивается, а собранный вывод сохраняется."""
-    lines = []
-    status = "ok"
-    try:
-        proc = subprocess.Popen(parts, stdout=subprocess.PIPE,
-                                stderr=subprocess.STDOUT, text=True, bufsize=1)
-    except FileNotFoundError:
-        rail_line(col("Не удалось запустить процесс.", C.RED))
-        return 1, ["<не удалось запустить>"], "error"
-
-    def reader():
-        try:
-            for line in proc.stdout:
-                line = line.rstrip("\n")
-                rail_line(line)
-                lines.append(line)
-        except Exception:
-            pass
-
-    th = threading.Thread(target=reader, daemon=True)
-    th.start()
-
-    def kill():
-        proc.terminate()
-        try:
-            proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-
-    try:
-        proc.wait(timeout=timeout if timeout else None)
-    except subprocess.TimeoutExpired:
-        kill()
-        status = "timeout"
-        rail_line(col(f"⏱ Превышен лимит времени ({timeout}s) — процесс остановлен. "
-                      f"Сохраняю то, что успело прийти.", C.YELLOW))
-    except KeyboardInterrupt:
-        kill()
-        status = "interrupted"
-        rail_line(col("Прервано пользователем — сохраняю то, что успело прийти.", C.GREY))
-
-    th.join(timeout=2)
-    rc = proc.returncode if proc.returncode is not None else -1
-    return rc, lines, status
-
-
 def run_action(action):
     print(col(f"\n  {action.explain}", C.GREY))
     if action.requires_auth:
-        print(col("  ⚠  АКТИВНО ОБРАЩАЕТСЯ К ЦЕЛИ — запускай только с разрешения владельца",
+        print(col("  ⚠  АКТИВНО ОБРАЩАЕТСЯ К ЦЕЛИ — только с разрешения владельца",
                   C.RED + C.BOLD))
     if action.note:
         print(col(f"  ℹ  {action.note}", C.GREY))
 
-    # ---- встроенная функция ----
-    if action.func is not None:
-        target = input(col(f"\n  {action.prompt}: ", C.LILAC)).strip() if action.prompt else ""
-        print()
-        panel_open(action.name)
-        t = time.perf_counter()
-        ok = True
-        lines = []
-        try:
-            lines = list(action.func(target))
-            rail(lines)
-        except Exception as e:
-            ok = False
-            lines = [f"Ошибка: {e}"]
-            rail(lines)
-        panel_close(ok, time.perf_counter() - t)
-        save_result(action, target, "(встроенная функция)", 0 if ok else 1, lines)
-        print()
-        show_session_table()
-        return
-
-    # ---- внешний инструмент ----
-    if not shutil.which(action.binary):
+    if action.binary and not shutil.which(action.binary):
         show_install_help(action)
         return
-
-    # нужны root-права, но их нет и sudo недоступен
     if action.needs_root and not is_root() and not shutil.which("sudo"):
-        print(col("\n  ✗ Этой команде нужны root-права, а sudo не найден.", C.RED + C.BOLD))
-        print(col("    Запусти Voker от root или установи sudo и повтори.", C.GREY))
+        print(col("\n  ✗ Нужны root-права, а sudo не найден.", C.RED + C.BOLD))
+        print(col("    Запусти Voker от root и повтори.", C.GREY))
         return
 
-    target = ""
-    if action.prompt:
-        target = input(col(f"\n  {action.prompt}: ", C.LILAC)).strip()
-        if not target:
-            if action.default:
-                target = action.default
-            else:
-                print(col("  Пусто — отмена.", C.GREY))
-                return
+    # собираем спецификацию запуска
+    if action.wizard:
+        spec = action.wizard(action)
+        if not spec:
+            return
+    else:
+        target = ""
+        if action.prompt:
+            target = ask(action.prompt)
+            if not target:
+                if action.default:
+                    target = action.default
+                else:
+                    print(col("  Пусто — отмена.", C.GREY))
+                    return
+        outfile = ""
+        if action.outfile_ext:
+            RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+            stamp = time.strftime("%Y%m%d_%H%M%S")
+            outfile = str(RESULTS_DIR / f"{stamp}_{slug(action.binary)}.{action.outfile_ext}")
+        spec = ExecSpec(parts=build_parts(action, target, outfile), target=target,
+                        parser=action.parser, typical=action.typical,
+                        outfile=outfile, title=action.name)
 
-    outfile = ""
-    if action.outfile_ext:
-        RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-        ts = time.strftime("%Y%m%d_%H%M%S")
-        outfile = str(RESULTS_DIR / f"{ts}_{slug(action.binary)}.{action.outfile_ext}")
-
-    parts = build_parts(action, target, outfile)
-    cmd_str = " ".join(shlex.quote(p) for p in parts)
-    title = action.name + (f"  ·  {target}" if target else "")
+    # выполняем
+    title = spec.title + (f"  ·  {spec.target}" if spec.target else "")
     print()
     panel_open(title)
-    t = time.perf_counter()
 
     if action.interactive:
-        # живой ввод — без перехвата, вывод не сохраняем
-        ok = True
-        status = "ok"
-        try:
-            r = subprocess.run(parts)
-            rc = r.returncode
-            ok = (rc == 0)
-        except KeyboardInterrupt:
-            ok = False
-            rc = 130
-            status = "interrupted"
-            print(col("\n  Прервано.", C.GREY))
-        panel_close(ok, time.perf_counter() - t)
-        note = "(интерактивный инструмент — вывод не сохранён)"
-        if status == "interrupted":
-            note = "(интерактивный инструмент — прервано пользователем)"
-        save_result(action, target, cmd_str, rc, [note], status=status)
+        rc, status = run_interactive(spec.parts)
+        rep = Report("Готово" if status == "ok" else "Прервано", "info",
+                     [("Инструмент работал в своём окне — отчёт не формируется.", "info")])
     else:
-        rc, lines, status = run_and_capture(parts, timeout=action.timeout)
-        ok = (status == "ok" and rc == 0)
-        panel_close(ok, time.perf_counter() - t)
-        artifact = outfile if (outfile and Path(outfile).exists()) else None
-        save_result(action, target, cmd_str, rc, lines, artifact=artifact, status=status)
-        if artifact:
-            print(col(f"  💾 Файл сохранён: {artifact}", C.GREEN))
-            print(col("     Открой его в Wireshark для анализа.", C.GREY))
+        rc, lines, status = run_with_ui(spec.parts, timeout=action.timeout, typical=spec.typical)
+        rep = spec.parser(spec.target, rc, lines, status)
+        rep.raw_lines = lines
+        if status in ("timeout", "interrupted"):
+            rep.bullets.insert(0, ("Показан частичный результат — команда не завершилась полностью.", "warn"))
 
+    print()
+    show_report(rep)
+    txt, htmlf = save_result(action, spec, rc, status, rep)
+    print(col(f"\n  📄 Красивый отчёт: {htmlf}", C.GREEN))
+    print(col(f"     Открыть: xdg-open \"{htmlf}\"", C.GREY))
+    if spec.outfile and Path(spec.outfile).exists():
+        print(col(f"  💾 Файл трафика: {spec.outfile}  (открой в Wireshark)", C.GREEN))
     print()
     show_session_table()
 
 
 # ============================ МЕНЮ ============================
 
-def show_installed():
+CONFIRMED_CATS = set()
+
+
+def category_gate(cat):
+    """Разовое подтверждение при первом входе в защищённую категорию за сессию."""
+    if not cat.gated or cat.name in CONFIRMED_CATS:
+        return True
     print()
-    panel_open("Что установлено")
-    for cat in TOOLKIT:
-        for act in cat.actions:
-            if act.func is not None:
-                mark, tail = col("✓", C.GREEN), "встроенное"
-            elif shutil.which(act.binary):
-                mark, tail = col("✓", C.GREEN), act.binary
-            else:
-                mark, tail = col("✗", C.RED), act.binary + " — не установлен"
-            print(col("│ ", C.PURPLE_DEEP) + f"{mark} " + col(act.name, C.LILAC) + col(f"  ({tail})", C.GREY))
-    panel_close(True, 0.0)
+    panel_card("⚠  " + cat.name + " — активные инструменты", C.RED + C.BOLD)
+    for line in cat.gate_text.split("\n"):
+        print(col("  " + line.strip(), C.YELLOW))
+    ans = input(col("\n  Подтверди: цель — учебная площадка или своя система? "
+                    "Введи 'ДА': ", C.YELLOW)).strip().lower()
+    if ans not in ("да", "yes", "y"):
+        print(col("  Не подтверждено — возврат в меню.", C.GREY))
+        return False
+    CONFIRMED_CATS.add(cat.name)
+    return True
 
 
 def category_menu(cat):
+    if not category_gate(cat):
+        return
     while True:
         print()
         panel_open(cat.name)
@@ -895,26 +1179,25 @@ def main_menu():
     total = sum(len(c.actions) for c in TOOLKIT)
     while True:
         print()
-        panel_open(f"Главное меню  ·  {total} команд")
+        panel_open(f"Главное меню  ·  {total} инструментов")
         for i, cat in enumerate(TOOLKIT, 1):
-            print(col(f"  [{i}] ", C.PURPLE_BRIGHT) + col(cat.name, C.LILAC) + col(f"  ({len(cat.actions)})", C.GREY))
+            tag = col("  ⚠ активное", C.RED + C.BOLD) if cat.gated else ""
+            print(col(f"  [{i}] ", C.PURPLE_BRIGHT) + col(cat.name, C.LILAC)
+                  + col(f"  ({len(cat.actions)})", C.GREY) + tag)
             print(col(f"       {cat.desc}", C.GREY))
-        print(col("\n  [r] Результаты этой сессии", C.GREY))
-        print(col("  [i] Проверить установленные инструменты", C.GREY))
+        print(col("\n  [o] Собрать общий отчёт сессии (HTML)", C.GREY))
         print(col("  [q] Выход", C.GREY))
         choice = input(col("\n  Выбор: ", C.YELLOW)).strip().lower()
         if choice in ("q", "quit", "exit"):
             print(col("\n  До встречи. Учись легально. 💜\n", C.PURPLE_BRIGHT))
             return
-        if choice == "i":
-            show_installed()
-            input(col("\n  Нажми Enter, чтобы продолжить...", C.GREY))
-            continue
-        if choice == "r":
-            print()
-            panel_open("Результаты сессии")
-            show_session_table()
-            panel_close(True, 0.0)
+        if choice == "o":
+            path = build_session_html()
+            if path:
+                print(col(f"\n  📄 Общий отчёт: {path}", C.GREEN))
+                print(col(f"     Открыть: xdg-open \"{path}\"", C.GREY))
+            else:
+                print(col("  Пока нечего собирать — сначала запусти пару команд.", C.GREY))
             input(col("\n  Нажми Enter, чтобы продолжить...", C.GREY))
             continue
         if choice.isdigit() and 1 <= int(choice) <= len(TOOLKIT):
@@ -923,7 +1206,36 @@ def main_menu():
             print(col("  Нет такого пункта.", C.RED))
 
 
-# ============================ CLI ============================
+# ============================ CLI / ДИСКЛЕЙМЕР ============================
+
+CONFIG_DIR = Path.home() / ".voker"
+ACCEPT_FILE = CONFIG_DIR / "accepted"
+
+DISCLAIMER = """
+╔══════════════════════════════════════════════════════════════════╗
+║                    ПРАВОВОЕ ПРЕДУПРЕЖДЕНИЕ                        ║
+╠══════════════════════════════════════════════════════════════════╣
+║  Voker — для ОБУЧЕНИЯ и ЛЕГАЛЬНОГО тестирования.                  ║
+║  Проверять чужие сети, сайты и Wi-Fi без письменного разрешения   ║
+║  владельца во многих странах — уголовное преступление.            ║
+║  То, что инструмент есть в Kali, НЕ делает его применение         ║
+║  законным. Законно то, что ты запускаешь по своим системам или    ║
+║  с разрешения. Ответственность — только твоя.                     ║
+╚══════════════════════════════════════════════════════════════════╝
+"""
+
+
+def ensure_disclaimer():
+    if ACCEPT_FILE.exists():
+        return
+    print(col(DISCLAIMER, C.PURPLE))
+    ans = input(col("Введи 'СОГЛАСЕН' чтобы продолжить: ", C.YELLOW)).strip().lower()
+    if ans not in ("согласен", "agree", "yes", "y"):
+        print(col("Без согласия работать нельзя. Выход.", C.RED))
+        sys.exit(0)
+    CONFIG_DIR.mkdir(exist_ok=True)
+    ACCEPT_FILE.write_text("accepted\n", encoding="utf-8")
+
 
 def print_tree():
     print_banner()
@@ -932,16 +1244,13 @@ def print_tree():
         print(col(f"▸ {cat.name}", C.PURPLE_BRIGHT + C.BOLD) + col(f" — {cat.desc}", C.GREY))
         for act in cat.actions:
             total += 1
-            if act.func is not None:
-                mark, tgt = col("✓", C.GREEN), "встроенное"
-            else:
-                ok = bool(shutil.which(act.binary))
-                mark = col("✓" if ok else "✗", C.GREEN if ok else C.RED)
-                tgt = act.binary
+            b = act.binary or "—"
+            ok = bool(shutil.which(act.binary)) if act.binary else True
+            mark = col("✓" if ok else "✗", C.GREEN if ok else C.RED)
             flags = " [auth]" if act.requires_auth else ""
-            print(f"    {mark} {act.name} " + col(f"→ {tgt}{flags}", C.GREY))
+            print(f"    {mark} {act.name} " + col(f"→ {b}{flags}", C.GREY))
         print()
-    print(col(f"Всего: {total} команд", C.LILAC))
+    print(col(f"Всего: {total} инструментов", C.LILAC))
 
 
 def main():
@@ -958,36 +1267,6 @@ def main():
         main_menu()
     except (KeyboardInterrupt, EOFError):
         print(col("\n\n  Выход.\n", C.GREY))
-
-
-# ============================ ДИСКЛЕЙМЕР ============================
-
-CONFIG_DIR = Path.home() / ".voker"
-ACCEPT_FILE = CONFIG_DIR / "accepted"
-
-DISCLAIMER = """
-╔══════════════════════════════════════════════════════════════════╗
-║                    ПРАВОВОЕ ПРЕДУПРЕЖДЕНИЕ                        ║
-╠══════════════════════════════════════════════════════════════════╣
-║  Voker — для ОБУЧЕНИЯ и ЛЕГАЛЬНОГО тестирования.                  ║
-║  Проверять чужие сети, сайты и Wi-Fi без письменного разрешения   ║
-║  владельца во многих странах — уголовное преступление.            ║
-║  Используй только на своих системах, с разрешения или на учебных  ║
-║  площадках (HackTheBox, TryHackMe). Ответственность — только твоя. ║
-╚══════════════════════════════════════════════════════════════════╝
-"""
-
-
-def ensure_disclaimer():
-    if ACCEPT_FILE.exists():
-        return
-    print(col(DISCLAIMER, C.PURPLE))
-    ans = input(col("Введи 'СОГЛАСЕН' чтобы продолжить: ", C.YELLOW)).strip().lower()
-    if ans not in ("согласен", "agree", "yes", "y"):
-        print(col("Без согласия работать нельзя. Выход.", C.RED))
-        sys.exit(0)
-    CONFIG_DIR.mkdir(exist_ok=True)
-    ACCEPT_FILE.write_text("accepted\n", encoding="utf-8")
 
 
 if __name__ == "__main__":
