@@ -24,6 +24,7 @@ import shutil
 import base64
 import hashlib
 import textwrap
+import threading
 import subprocess
 from pathlib import Path
 from typing import Optional, Callable
@@ -70,7 +71,7 @@ BANNER = r"""
 def print_banner():
     for line in BANNER.strip("\n").splitlines():
         print(col(line, C.PURPLE_BRIGHT + C.BOLD))
-    print(col("  тулкит-проводник для начинающих  ·  v0.3", C.LILAC))
+    print(col("  тулкит-проводник для начинающих  ·  v0.4", C.LILAC))
     print(col("  Voker вызывает инструменты, а не заменяет их знание", C.GREY))
     print()
 
@@ -169,6 +170,7 @@ class Action:
     interactive: bool = False   # нужен живой ввод (вывод не перехватываем)
     outfile_ext: str = ""       # если задано — {outfile} укажет на файл результата
     default: str = ""           # значение при пустом вводе
+    timeout: int = 0            # секунд до принудительной остановки (0 = без лимита)
     note: str = ""
 
 
@@ -438,13 +440,13 @@ TOOLKIT = [
                "Запускает скрипты поиска уязвимостей.",
                "Гоняет встроенные nmap-скрипты категории vuln и отмечает известные проблемы на открытых сервисах.",
                "Введи IP или домен", binary="nmap",
-               install={"apt": "sudo apt install nmap"}, args_template="--script vuln {target}", requires_auth=True),
+               install={"apt": "sudo apt install nmap"}, args_template="--script vuln {target}", requires_auth=True, timeout=1800),
         Action("Очень быстрый скан портов (masscan)",
                "Сканирует порты на большой скорости.",
                "Просматривает диапазон портов гораздо быстрее nmap. Хорош для больших сетей. Нужен root.",
                "Введи IP или подсеть", binary="masscan",
                install={"apt": "sudo apt install masscan"}, args_template="-p1-1000 {target} --rate 1000",
-               requires_auth=True, needs_root=True, note="Высокая скорость создаёт заметную нагрузку — только по своим целям."),
+               requires_auth=True, needs_root=True, timeout=600, note="Высокая скорость создаёт заметную нагрузку — только по своим целям."),
         Action("Маршрут до хоста (traceroute)",
                "Через какие узлы идёт путь до цели.",
                "Показывает цепочку промежуточных серверов между тобой и целью. Видно, где теряется связь.",
@@ -481,40 +483,40 @@ TOOLKIT = [
                "Введи URL сайта", binary="gobuster",
                install={"apt": "sudo apt install gobuster"},
                args_template="dir -u {target} -w /usr/share/wordlists/dirb/common.txt",
-               requires_auth=True, note="Словарь по указанному пути есть на Kali; на другой ОС укажи свой."),
+               requires_auth=True, timeout=900, note="Словарь по указанному пути есть на Kali; на другой ОС укажи свой."),
         Action("Поиск папок (dirb)",
                "Классический перебор директорий.",
                "Похоже на gobuster, но со встроенным словарём. Простой запуск без указания словаря.",
                "Введи URL сайта", binary="dirb",
-               install={"apt": "sudo apt install dirb"}, args_template="{target}", requires_auth=True),
+               install={"apt": "sudo apt install dirb"}, args_template="{target}", requires_auth=True, timeout=900),
         Action("Фаззинг адресов (ffuf)",
                "Быстро подбирает пути и параметры.",
                "Очень быстрый инструмент: подставляет слова из словаря в адрес и ищет живые страницы.",
                "Введи URL с FUZZ (site.com/FUZZ)", binary="ffuf",
                install={"apt": "sudo apt install ffuf"},
                args_template="-u {target} -w /usr/share/wordlists/dirb/common.txt",
-               requires_auth=True, note="В адресе укажи слово FUZZ там, где подставлять слова."),
+               requires_auth=True, timeout=900, note="В адресе укажи слово FUZZ там, где подставлять слова."),
         Action("Базовая проверка сайта (nikto)",
                "Ищет типовые уязвимости и мисконфиги.",
                "Проверяет сайт по большому списку известных проблем и устаревших файлов. Хороший обзорный скан.",
                "Введи URL сайта", binary="nikto",
-               install={"apt": "sudo apt install nikto"}, args_template="-h {target}", requires_auth=True),
+               install={"apt": "sudo apt install nikto"}, args_template="-h {target}", requires_auth=True, timeout=1200),
         Action("Сканер WordPress (wpscan)",
                "Плагины, темы и их известные проблемы.",
                "Если сайт на WordPress — находит версии темы и плагинов и сверяет с базой уязвимостей.",
                "Введи URL WordPress-сайта", binary="wpscan",
-               install={"apt": "sudo apt install wpscan"}, args_template="--url {target}", requires_auth=True),
+               install={"apt": "sudo apt install wpscan"}, args_template="--url {target}", requires_auth=True, timeout=1200),
         Action("Шаблонный поиск уязвимостей (nuclei)",
                "Проверяет сайт по базе шаблонов.",
                "Современный сканер: гоняет тысячи готовых шаблонов известных уязвимостей и мисконфигов.",
                "Введи URL сайта", binary="nuclei",
-               install={"apt": "sudo apt install nuclei"}, args_template="-u {target}", requires_auth=True),
+               install={"apt": "sudo apt install nuclei"}, args_template="-u {target}", requires_auth=True, timeout=1800),
         Action("Тест SQL-инъекций (sqlmap)",
                "Проверяет параметры на SQL-инъекции.",
                "Стандартный инструмент проверки на SQL-инъекции. Мощный и активный — только по своим/учебным целям.",
                "Введи URL с параметром (?id=1)", binary="sqlmap",
                install={"apt": "sudo apt install sqlmap"}, args_template="-u {target} --batch",
-               requires_auth=True, note="Активно взаимодействует с БД сайта. Запуск только с разрешения."),
+               requires_auth=True, timeout=1800, note="Активно взаимодействует с БД сайта. Запуск только с разрешения."),
     ]),
 
     Category("Wi-Fi", "Аудит беспроводных сетей (только с разрешения!)", [
@@ -625,7 +627,7 @@ def slug(s):
     return s[:40] or "none"
 
 
-def save_result(action, target, cmd_str, returncode, lines, artifact=None):
+def save_result(action, target, cmd_str, returncode, lines, artifact=None, status="ok"):
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     ts = time.strftime("%Y%m%d_%H%M%S")
     base = f"{ts}_{slug(action.binary or action.name)}_{slug(target)}"
@@ -636,6 +638,7 @@ def save_result(action, target, cmd_str, returncode, lines, artifact=None):
         f"Цель    : {target or '-'}",
         f"Команда : {cmd_str}",
         f"Код     : {returncode}",
+        f"Статус  : {status}",
         f"Время   : {ts}",
         "-" * 50,
     ]
@@ -644,7 +647,7 @@ def save_result(action, target, cmd_str, returncode, lines, artifact=None):
     entry = {
         "time": ts, "name": action.name, "tool": action.binary or "built-in",
         "target": target, "command": cmd_str, "exit_code": returncode,
-        "lines": len(lines), "txt_file": str(txt),
+        "status": status, "lines": len(lines), "txt_file": str(txt),
     }
     if artifact:
         entry["artifact"] = str(artifact)
@@ -658,10 +661,10 @@ def show_session_table():
     if not SESSION:
         rail(["Пока ничего не собрано."])
         return
-    headers = ["Время", "Пункт", "Цель", "Код", "Стр."]
+    headers = ["Время", "Пункт", "Цель", "Статус", "Стр."]
     rows = [[e["time"][-6:], e["name"], e["target"] or "-",
-             str(e["exit_code"]), str(e["lines"])] for e in SESSION]
-    print_table(headers, rows, caps=[8, 30, 22, 4, 5])
+             e.get("status", "ok"), str(e["lines"])] for e in SESSION]
+    print_table(headers, rows, caps=[8, 34, 24, 11, 5])
     print(col(f"  Полные результаты: {RESULTS_DIR}", C.GREY))
 
 
@@ -707,31 +710,60 @@ def build_parts(action, target, outfile=""):
     return parts
 
 
-def run_and_capture(parts):
-    """Запускает процесс, показывает вывод построчно и одновременно собирает его."""
+def run_and_capture(parts, timeout=0):
+    """Запускает процесс, стримит вывод и собирает его.
+    Возвращает (код, строки, статус). Статус: ok | timeout | interrupted | error.
+    При таймауте/прерывании процесс убивается, а собранный вывод сохраняется."""
     lines = []
+    status = "ok"
     try:
         proc = subprocess.Popen(parts, stdout=subprocess.PIPE,
                                 stderr=subprocess.STDOUT, text=True, bufsize=1)
     except FileNotFoundError:
         rail_line(col("Не удалось запустить процесс.", C.RED))
-        return 1, ["<не удалось запустить>"]
-    try:
-        for line in proc.stdout:
-            line = line.rstrip("\n")
-            rail_line(line)
-            lines.append(line)
-        proc.wait()
-    except KeyboardInterrupt:
+        return 1, ["<не удалось запустить>"], "error"
+
+    def reader():
+        try:
+            for line in proc.stdout:
+                line = line.rstrip("\n")
+                rail_line(line)
+                lines.append(line)
+        except Exception:
+            pass
+
+    th = threading.Thread(target=reader, daemon=True)
+    th.start()
+
+    def kill():
         proc.terminate()
-        rail_line(col("Прервано пользователем.", C.GREY))
-    return proc.returncode, lines
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+
+    try:
+        proc.wait(timeout=timeout if timeout else None)
+    except subprocess.TimeoutExpired:
+        kill()
+        status = "timeout"
+        rail_line(col(f"⏱ Превышен лимит времени ({timeout}s) — процесс остановлен. "
+                      f"Сохраняю то, что успело прийти.", C.YELLOW))
+    except KeyboardInterrupt:
+        kill()
+        status = "interrupted"
+        rail_line(col("Прервано пользователем — сохраняю то, что успело прийти.", C.GREY))
+
+    th.join(timeout=2)
+    rc = proc.returncode if proc.returncode is not None else -1
+    return rc, lines, status
 
 
 def run_action(action):
     print(col(f"\n  {action.explain}", C.GREY))
     if action.requires_auth:
-        print(col("  • активно обращается к цели — только с разрешения", C.GREY))
+        print(col("  ⚠  АКТИВНО ОБРАЩАЕТСЯ К ЦЕЛИ — запускай только с разрешения владельца",
+                  C.RED + C.BOLD))
     if action.note:
         print(col(f"  ℹ  {action.note}", C.GREY))
 
@@ -761,6 +793,12 @@ def run_action(action):
         show_install_help(action)
         return
 
+    # нужны root-права, но их нет и sudo недоступен
+    if action.needs_root and not is_root() and not shutil.which("sudo"):
+        print(col("\n  ✗ Этой команде нужны root-права, а sudo не найден.", C.RED + C.BOLD))
+        print(col("    Запусти Voker от root или установи sudo и повтори.", C.GREY))
+        return
+
     target = ""
     if action.prompt:
         target = input(col(f"\n  {action.prompt}: ", C.LILAC)).strip()
@@ -787,23 +825,27 @@ def run_action(action):
     if action.interactive:
         # живой ввод — без перехвата, вывод не сохраняем
         ok = True
+        status = "ok"
         try:
             r = subprocess.run(parts)
-            ok = (r.returncode == 0)
             rc = r.returncode
+            ok = (rc == 0)
         except KeyboardInterrupt:
             ok = False
             rc = 130
+            status = "interrupted"
             print(col("\n  Прервано.", C.GREY))
         panel_close(ok, time.perf_counter() - t)
-        save_result(action, target, cmd_str, rc,
-                    ["(интерактивный инструмент — вывод не сохранён)"])
+        note = "(интерактивный инструмент — вывод не сохранён)"
+        if status == "interrupted":
+            note = "(интерактивный инструмент — прервано пользователем)"
+        save_result(action, target, cmd_str, rc, [note], status=status)
     else:
-        rc, lines = run_and_capture(parts)
-        ok = (rc == 0)
+        rc, lines, status = run_and_capture(parts, timeout=action.timeout)
+        ok = (status == "ok" and rc == 0)
         panel_close(ok, time.perf_counter() - t)
         artifact = outfile if (outfile and Path(outfile).exists()) else None
-        save_result(action, target, cmd_str, rc, lines, artifact=artifact)
+        save_result(action, target, cmd_str, rc, lines, artifact=artifact, status=status)
         if artifact:
             print(col(f"  💾 Файл сохранён: {artifact}", C.GREEN))
             print(col("     Открой его в Wireshark для анализа.", C.GREY))
@@ -835,7 +877,8 @@ def category_menu(cat):
         panel_open(cat.name)
         print(col(f"  {cat.desc}\n", C.GREY))
         for i, act in enumerate(cat.actions, 1):
-            print(col(f"  [{i}] ", C.PURPLE_BRIGHT) + col(act.name, C.LILAC))
+            tag = col("  ⚠", C.RED + C.BOLD) if act.requires_auth else ""
+            print(col(f"  [{i}] ", C.PURPLE_BRIGHT) + col(act.name, C.LILAC) + tag)
             print(col(f"       {act.desc}", C.GREY))
         print(col("\n  [0] Назад", C.GREY))
         choice = input(col("\n  Выбор: ", C.YELLOW)).strip()
