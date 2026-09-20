@@ -1105,6 +1105,17 @@ def run_action(action):
                         outfile=outfile, title=action.name)
 
     # выполняем
+    # scope-guard: активные действия не должны бить вне разрешённых доменов
+    if action.requires_auth and spec.target and not in_scope(spec.target):
+        print(col("\n  ⛔ ЦЕЛЬ ВНЕ SCOPE", C.RED + C.BOLD))
+        print(col(f"     {host_of(spec.target)} нет в списке разрешённых доменов.", C.YELLOW))
+        print(col("     В баг-баунти выход за scope = бан из программы или хуже.", C.YELLOW))
+        print(col(f"     Текущий scope: {', '.join(sorted(SCOPE)) or '(пусто)'}", C.GREY))
+        ans = input(col("     Всё равно запустить? Введи 'ВНЕ SCOPE': ", C.YELLOW)).strip().upper()
+        if ans != "ВНЕ SCOPE":
+            print(col("     Отменено — цель вне scope.", C.GREY))
+            return
+
     title = spec.title + (f"  ·  {spec.target}" if spec.target else "")
     print()
     panel_open(title)
@@ -1129,6 +1140,293 @@ def run_action(action):
         print(col(f"  💾 Файл трафика: {spec.outfile}  (открой в Wireshark)", C.GREEN))
     print()
     show_session_table()
+
+
+# ============================ SCOPE-GUARD ============================
+
+SCOPE_FILE = Path.home() / ".voker" / "scope.txt"
+SCOPE = set()
+
+
+def load_scope():
+    SCOPE.clear()
+    if SCOPE_FILE.exists():
+        for line in SCOPE_FILE.read_text(encoding="utf-8").splitlines():
+            d = line.strip().lower()
+            if d:
+                SCOPE.add(d)
+
+
+def save_scope():
+    SCOPE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    SCOPE_FILE.write_text("\n".join(sorted(SCOPE)) + "\n", encoding="utf-8")
+
+
+def host_of(target):
+    import urllib.parse
+    t = (target or "").strip()
+    if "://" in t:
+        t = urllib.parse.urlparse(t).netloc
+    t = t.split("/")[0].split(":")[0]
+    return t.lower()
+
+
+def in_scope(target):
+    if not SCOPE:
+        return True                 # scope не задан — ограничений нет
+    h = host_of(target)
+    return any(h == d or h.endswith("." + d) for d in SCOPE)
+
+
+def scope_menu():
+    while True:
+        print()
+        panel_open("Scope — разрешённые домены")
+        if SCOPE:
+            for d in sorted(SCOPE):
+                print(col("   ✓ ", C.GREEN) + col(d, C.LILAC))
+        else:
+            print(col("   (пусто — ограничений нет, активные команды бьют по любой цели)", C.YELLOW))
+        print(col("\n  Пока scope задан, команды вне него блокируются.", C.GREY))
+        print(col("\n  [1] Добавить домен", C.GREY))
+        print(col("  [2] Очистить scope", C.GREY))
+        print(col("  [0] Назад", C.GREY))
+        ch = input(col("\n  Выбор: ", C.YELLOW)).strip()
+        if ch == "0":
+            return
+        if ch == "1":
+            d = input(col("  Домен из scope программы (example.com): ", C.LILAC)).strip().lower()
+            d = host_of(d)
+            if d:
+                SCOPE.add(d)
+                save_scope()
+                print(col(f"  Добавлено: {d}", C.GREEN))
+        elif ch == "2":
+            SCOPE.clear()
+            save_scope()
+            print(col("  Scope очищен.", C.GREY))
+
+
+# ============================ ПАРСЕРЫ BUG BOUNTY ============================
+
+def p_subfinder(target, rc, lines, status):
+    subs = sorted(set(l.strip() for l in lines if l.strip() and "." in l))
+    if not subs:
+        return Report(f"Поддоменов для {target} не найдено", "info",
+                      [("Ничего не нашлось.", "info")])
+    b = [(f"Найдено поддоменов: {len(subs)}", "info")]
+    for s in subs[:30]:
+        b.append((s, "info"))
+    return Report(f"У {target} найдено {len(subs)} поддоменов", "info", b)
+
+
+def p_httpx(target, rc, lines, status):
+    live = [l.strip() for l in lines if l.strip().startswith("http")]
+    if not live:
+        return Report("Живых хостов не найдено", "info", [("Никто не ответил по HTTP(S).", "info")])
+    b = [(f"Живых веб-хостов: {len(live)}", "info")]
+    for u in live[:30]:
+        b.append((u, "info"))
+    return Report(f"Отвечает {len(live)} хостов", "info", b)
+
+
+def p_gau(target, rc, lines, status):
+    urls = sorted(set(l.strip() for l in lines if l.strip().startswith("http")))
+    if not urls:
+        return Report("Архивных URL не найдено", "info", [("Веб-архив ничего не отдал.", "info")])
+    b = [(f"Найдено URL в архивах: {len(urls)}", "info"),
+         ("Ищи среди них старые API, параметры, .js, забытые пути.", "info")]
+    for u in urls[:20]:
+        b.append((u, "info"))
+    return Report(f"{len(urls)} архивных URL для {target}", "info", b)
+
+
+def p_ffuf(target, rc, lines, status):
+    hits = [l.strip() for l in lines if l.strip() and not l.strip().startswith(":")]
+    hits = [l for l in hits if re.search(r"\bStatus:\s*\d+", l) or l.startswith("/")]
+    if not hits:
+        return Report("Скрытых путей не найдено", "info", [("По словарю ничего живого.", "info")])
+    b = [(f"Найдено путей: {len(hits)}", "warn")]
+    for h in hits[:25]:
+        b.append((h, "info"))
+    return Report(f"Найдены скрытые пути на {target}", "warn", b)
+
+
+def p_nuclei(target, rc, lines, status):
+    sev = {"critical": 0, "high": 0, "medium": 0, "low": 0, "info": 0}
+    findings = []
+    for l in lines:
+        m = re.search(r"\[(critical|high|medium|low|info)\]", l, re.I)
+        if m:
+            s = m.group(1).lower()
+            sev[s] += 1
+            findings.append((s, l.strip()))
+    total = sum(sev.values())
+    if total == 0:
+        return Report("Уязвимостей не найдено", "good",
+                      [("nuclei не отметил проблем по своим шаблонам.", "good")])
+    lvl = "bad" if (sev["critical"] or sev["high"]) else ("warn" if sev["medium"] else "info")
+    b = [(f"critical {sev['critical']} · high {sev['high']} · medium {sev['medium']}"
+          f" · low {sev['low']} · info {sev['info']}", lvl)]
+    for s, line in findings:
+        if s in ("critical", "high"):
+            b.append((line, "bad"))
+    for s, line in findings:
+        if s == "medium":
+            b.append((line, "warn"))
+    return Report(f"nuclei нашёл {total} находок", lvl, b[:22])
+
+
+# ============================ ИНСТРУМЕНТЫ BUG BOUNTY ============================
+
+BB_TOOLS = [
+    Action("Поддомены (subfinder)", "Шаг 1 — найти все поддомены цели.",
+           "Масштабно собирает поддомены домена из множества источников. С этого "
+           "начинается веб-разведка: чем больше поверхность, тем больше шансов на баг.",
+           "Введи домен (in-scope)", binary="subfinder",
+           install={"apt": "sudo apt install subfinder"}, args_template="-d {target} -silent",
+           parser=p_subfinder, requires_auth=True, typical="20–90 сек"),
+    Action("Живые хосты (httpx)", "Шаг 2 — какие из поддоменов отвечают.",
+           "Проверяет, какие хосты реально живы по HTTP(S). Дальше работаем только "
+           "с живыми — остальные тратят время.",
+           "Введи домен или хост", binary="httpx",
+           install={"apt": "sudo apt install httpx-toolkit"},
+           args_template="-u {target} -silent -title -status-code -tech-detect",
+           parser=p_httpx, requires_auth=True, typical="10–40 сек",
+           note="Это httpx от ProjectDiscovery (не питоновская библиотека)."),
+    Action("Архивные URL (gau)", "Шаг 3 — забытые старые адреса из веб-архива.",
+           "Достаёт исторические URL цели из Wayback Machine и других архивов. Там "
+           "часто лежат старые API, параметры и забытые страницы — золото баг-баунти.",
+           "Введи домен (in-scope)", binary="gau",
+           install={"go": "go install github.com/lc/gau/v2/cmd/gau@latest"},
+           args_template="{target}", parser=p_gau, requires_auth=True, timeout=300,
+           typical="20–90 сек"),
+    Action("Скрытые пути (ffuf)", "Шаг 4 — перебор непубличных путей.",
+           "Подставляет слова из словаря вместо FUZZ и находит скрытые страницы и "
+           "эндпоинты, которых нет в ссылках.",
+           "URL с FUZZ (https://site/FUZZ)", binary="ffuf",
+           install={"apt": "sudo apt install ffuf"},
+           args_template="-u {target} -w /usr/share/wordlists/dirb/common.txt -s",
+           parser=p_ffuf, requires_auth=True, timeout=900, typical="1–10 минут",
+           note="Впиши слово FUZZ в адрес там, где перебирать."),
+    Action("Сканер уязвимостей (nuclei)", "Шаг 5 — прогнать по шаблонам уязвимостей.",
+           "Главная рабочая лошадь баг-баунти: гоняет тысячи готовых шаблонов "
+           "известных уязвимостей и мисконфигов по цели.",
+           "Введи URL или домен (in-scope)", binary="nuclei",
+           install={"apt": "sudo apt install nuclei"}, args_template="-u {target} -silent",
+           parser=p_nuclei, requires_auth=True, timeout=1800, typical="1–15 минут"),
+]
+
+
+# ============================ ПАЙПЛАЙН РАЗВЕДКИ ============================
+
+def _step(n, total, title):
+    print()
+    panel_card(f"Шаг {n}/{total} · {title}", C.PURPLE_BRIGHT + C.BOLD)
+
+
+def run_pipeline():
+    print(col("\n  Полная разведка: поддомены → живые хосты → уязвимости.", C.GREY))
+    print(col("  Всё по одному домену, результат — единый отчёт.", C.GREY))
+    domain = input(col("\n  Домен для разведки (in-scope): ", C.LILAC)).strip()
+    if not domain:
+        print(col("  Пусто — отмена.", C.GREY))
+        return
+    if not in_scope(domain):
+        print(col("\n  ⛔ Домен вне scope. Сначала добавь его в scope или проверь список.", C.RED + C.BOLD))
+        return
+    need = ["subfinder", "httpx", "nuclei"]
+    missing = [t for t in need if not shutil.which(t)]
+    if missing:
+        print(col(f"\n  Для пайплайна нужны: {', '.join(need)}.", C.RED))
+        print(col(f"  Не установлены: {', '.join(missing)} — поставь их и повтори.", C.GREY))
+        return
+
+    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    stamp = time.strftime("%Y%m%d_%H%M%S")
+    subs_file = RESULTS_DIR / f"{stamp}_subs.txt"
+    live_file = RESULTS_DIR / f"{stamp}_live.txt"
+    raw = []
+
+    # Шаг 1 — поддомены
+    _step(1, 3, "ищу поддомены (subfinder)")
+    rc, subs_lines, st = run_with_ui(["subfinder", "-d", domain, "-silent"],
+                                     timeout=300, typical="20–90 сек")
+    subs = sorted(set([l.strip() for l in subs_lines if l.strip() and "." in l] + [domain]))
+    subs_file.write_text("\n".join(subs) + "\n", encoding="utf-8")
+    raw += [f"# поддомены ({len(subs)})"] + subs
+    print(col(f"  → поддоменов: {len(subs)}", C.LILAC))
+
+    # Шаг 2 — живые хосты
+    _step(2, 3, "проверяю, кто жив (httpx)")
+    rc, live_lines, st = run_with_ui(["httpx", "-l", str(subs_file), "-silent"],
+                                     timeout=300, typical="20–60 сек")
+    live = sorted(set(l.strip() for l in live_lines if l.strip().startswith("http")))
+    live_file.write_text("\n".join(live) + "\n", encoding="utf-8")
+    raw += ["", f"# живые хосты ({len(live)})"] + live
+    print(col(f"  → живых хостов: {len(live)}", C.LILAC))
+
+    if not live:
+        print(col("\n  Живых хостов нет — дальше сканировать нечего.", C.YELLOW))
+        return
+
+    # Шаг 3 — уязвимости
+    _step(3, 3, "ищу уязвимости (nuclei)")
+    rc, find_lines, st = run_with_ui(["nuclei", "-l", str(live_file), "-silent"],
+                                     timeout=1800, typical="1–15 минут")
+    raw += ["", "# nuclei"] + [l for l in find_lines if l.strip()]
+
+    # общий отчёт
+    nrep = p_nuclei(domain, rc, find_lines, st)
+    rep = Report(f"Разведка {domain}: {len(subs)} поддоменов, {len(live)} живых",
+                 nrep.level,
+                 [(f"Поддоменов найдено: {len(subs)}", "info"),
+                  (f"Живых веб-хостов: {len(live)}", "info")] + nrep.bullets)
+    rep.raw_lines = raw
+
+    print()
+    show_report(rep)
+    fake = Action("Разведка для баг-баунти", "", "", binary="")
+    spec = ExecSpec(parts=["pipeline", domain], target=domain,
+                    parser=p_generic, title="Разведка (пайплайн)")
+    _, htmlf = save_result(fake, spec, 0, st, rep)
+    print(col(f"\n  📄 Отчёт разведки: {htmlf}", C.GREEN))
+    print(col(f"     Открыть: xdg-open \"{htmlf}\"", C.GREY))
+    print()
+    show_session_table()
+
+
+# ============================ МЕНЮ BUG BOUNTY ============================
+
+def bugbounty_menu():
+    while True:
+        print()
+        panel_open("Bug Bounty · пошаговый режим")
+        print(col("  Порядок работы: задай scope → разведка → поиск уязвимостей.", C.GREY))
+        print(col("  Баг-баунти — авторизованное тестирование, но строго в рамках scope!\n", C.GREY))
+        print(col("  [s] ", C.PURPLE_BRIGHT) + col("Задать scope (разрешённые домены)", C.LILAC)
+              + col("  ← начни отсюда", C.YELLOW))
+        print(col(f"       сейчас в scope: {', '.join(sorted(SCOPE)) or '(пусто)'}", C.GREY))
+        for i, act in enumerate(BB_TOOLS, 1):
+            print(col(f"  [{i}] ", C.PURPLE_BRIGHT) + col(act.name, C.LILAC)
+                  + col("  ⚠", C.RED + C.BOLD))
+            print(col(f"       {act.desc}", C.GREY))
+        print(col("  [p] ", C.PURPLE_BRIGHT) + col("⚡ Полный пайплайн: поддомены → живые → уязвимости", C.LILAC))
+        print(col("       одной командой по одному домену, единый отчёт", C.GREY))
+        print(col("\n  [0] Назад", C.GREY))
+        ch = input(col("\n  Выбор: ", C.YELLOW)).strip().lower()
+        if ch == "0":
+            return
+        if ch == "s":
+            scope_menu()
+        elif ch == "p":
+            run_pipeline()
+            input(col("\n  Нажми Enter, чтобы продолжить...", C.GREY))
+        elif ch.isdigit() and 1 <= int(ch) <= len(BB_TOOLS):
+            run_action(BB_TOOLS[int(ch) - 1])
+            input(col("\n  Нажми Enter, чтобы продолжить...", C.GREY))
+        else:
+            print(col("  Нет такого пункта.", C.RED))
 
 
 # ============================ МЕНЮ ============================
@@ -1185,12 +1483,21 @@ def main_menu():
             print(col(f"  [{i}] ", C.PURPLE_BRIGHT) + col(cat.name, C.LILAC)
                   + col(f"  ({len(cat.actions)})", C.GREY) + tag)
             print(col(f"       {cat.desc}", C.GREY))
-        print(col("\n  [o] Собрать общий отчёт сессии (HTML)", C.GREY))
+        print(col("\n  [b] ", C.PURPLE_BRIGHT) + col("🎯 Bug Bounty — пошаговый режим", C.LILAC))
+        print(col("  [s] ", C.PURPLE_BRIGHT) + col("Scope — разрешённые домены", C.LILAC)
+              + col(f"   ({len(SCOPE)} в списке)", C.GREY))
+        print(col("  [o] Собрать общий отчёт сессии (HTML)", C.GREY))
         print(col("  [q] Выход", C.GREY))
         choice = input(col("\n  Выбор: ", C.YELLOW)).strip().lower()
         if choice in ("q", "quit", "exit"):
             print(col("\n  До встречи. Учись легально. 💜\n", C.PURPLE_BRIGHT))
             return
+        if choice == "b":
+            bugbounty_menu()
+            continue
+        if choice == "s":
+            scope_menu()
+            continue
         if choice == "o":
             path = build_session_html()
             if path:
@@ -1264,6 +1571,7 @@ def main():
     try:
         print_banner()
         ensure_disclaimer()
+        load_scope()
         main_menu()
     except (KeyboardInterrupt, EOFError):
         print(col("\n\n  Выход.\n", C.GREY))
